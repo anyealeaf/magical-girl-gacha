@@ -906,7 +906,9 @@
     var s = d.settings || {}
     add(s.coverImageUrl)
     for (var k in s.emojiUrls || {}) add(s.emojiUrls[k])
-    return out
+    return out.map(function (u) {
+      return u.indexOf(GITEE_IMG) === 0 ? u.slice(GITEE_IMG.length) : u
+    }).filter(function (u, i, a) { return u && a.indexOf(u) === i })
   }
 
   /**
