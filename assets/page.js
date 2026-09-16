@@ -203,6 +203,19 @@
     return node
   }
 
+  var GITEE_IMG = 'https://gitee.com/qq1292012789/magical-girl-gacha/raw/main/'
+  document.addEventListener(
+    'error',
+    function (ev) {
+      var img = ev.target
+      if (!img || img.tagName !== 'IMG') return
+      var s = img.getAttribute('src') || ''
+      if (s.indexOf(GITEE_IMG) !== 0) return
+      img.setAttribute('src', s.slice(GITEE_IMG.length))
+    },
+    true
+  )
+
   function announce(msg) {
     var a = state.els.announce
     if (a) a.textContent = String(msg)
