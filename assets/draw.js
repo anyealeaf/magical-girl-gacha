@@ -1361,7 +1361,11 @@
     }
     return {
       enabled: cfg.enabled !== false,
-      points: Math.max(0, Math.floor(Number(cfg.points === undefined ? 300 : cfg.points))),
+      /**
+       * 每天签到的基础点数。兜底值与 `lib/data.js` 的 `defaultDaily().points` 必须一致
+       *（2026-09-20 用户把它从 300 改成 400；`test-plugin.mjs` 有一条断言钉着这两处）。
+       */
+      points: Math.max(0, Math.floor(Number(cfg.points === undefined ? 400 : cfg.points))),
       rerolls: Math.max(0, Math.min(20, Math.floor(Number(cfg.rerolls === undefined ? 3 : cfg.rerolls)))),
       refreshHour: Math.max(0, Math.min(23, Math.floor(Number(cfg.refreshHour === undefined ? 3 : cfg.refreshHour)))),
       rarities: rarities,

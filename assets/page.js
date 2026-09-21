@@ -633,6 +633,62 @@
      * 后端（动态站）本来会靠响应里那份 player 自愈，但**本机那一刻**是错的。
      */
     if (patch.shatterPity) p.shatterPity = patch.shatterPity
+    /*
+     * 记完账立刻对一次「集齐系列才有」的纪念卡。
+     *
+     * 用户 2026-09-20：「在收集完成『冥幽』系列之后领取……如果后续推出新的卡片，
+     * 则纪念卡会被回收，在重新收集完成时再次获得」。所以它必须在**每一次**
+     * 状态变化之后重算 —— 抽到系列最后一张卡的那一刻就该拿到，
+     * 而不是「等下次刷新页面时服务端顺手补上」（静态站根本没有服务端）。
+     */
+    syncMemorials({ announce: true })
+  }
+
+  /**
+   * 「集齐系列才有」的纪念卡对账（发放 / 回收）。
+   *
+   * 规则本体在 `page/shards.js` 的 `reconcileMemorials` —— 服务端、导出、客户端
+   * 同一份源码；这里只负责**把结果落回当前站的状态载体**：
+   *   · 动态站 -> 内存快照（服务端那份是权威，它也在同一个位置对账）
+   *   · 静态站 -> localStorage（没有服务端，本机就是权威）
+   *
+   * @param {{announce?:boolean}} opts `announce` = 这次变化值得报一声（抽卡之后），
+   *        每次渲染都报的话，开页面就会被自己的纪念卡刷屏。
+   * @returns {{changed:boolean, granted:Array, revoked:Array}|null}
+   */
+  function syncMemorials(opts) {
+    var S = window.GachaShards
+    if (!S || typeof S.reconcileMemorials !== 'function' || !state.data) return null
+    var r = S.reconcileMemorials(dataWithState())
+    if (!r.changed) return r
+
+    var s = localState()
+    s.owned = r.owned
+    s.foils = r.foils
+    saveLocal(s)
+    if (state.data.player && typeof state.data.player === 'object') {
+      state.data.player.owned = r.owned
+      state.data.player.foils = r.foils
+    }
+
+    if (opts && opts.announce) {
+      var names = function (list) {
+        return list
+          .map(function (x) { return '「' + x.card.name + '」' })
+          .join('、')
+      }
+      if (r.granted.length) {
+        toast('集齐「' + r.granted[0].progress.series + '」系列，获得纪念卡 ' + names(r.granted) + '（含全部特殊工艺）', 'ok')
+      }
+      if (r.revoked.length) {
+        toast(
+          '「' + r.revoked[0].progress.series + '」系列又新增了卡，纪念卡 ' + names(r.revoked) +
+            ' 已暂时回收（重新集齐 ' + r.revoked[0].progress.total + ' 张后会再发一次）',
+          'error'
+        )
+      }
+    }
+    return r
   }
 
   /**
@@ -2992,9 +3048,12 @@
       })
     }
 
-    // 纪念卡：**只**通过「清空缓存」重置存档时赠送，不进任何卡池
-    //（用户要求：无法抽卡获取）。所以它们不能被算进「没挂到卡池的卡」那个
-    // 警告组 —— 那是给「数据配错了」用的，而纪念卡不进池是**设计**。
+    // 纪念卡：**不进任何卡池**，只有两条获取途径（用户 2026-09-20 起）：
+    //   ① 重置存档时赠送（奇迹系列）
+    //   ② **集齐指定系列**后自动获得（镜溯·渊与幽 -> 冥幽；系列扩编会回收，
+    //      重新集齐再发一次。判定在 shards.js 的 reconcileMemorials）
+    // 它们不能被算进「没挂到卡池的卡」那个警告组 —— 那是给「数据配错了」用的，
+    // 而纪念卡不进池是**设计**。
     var memorial = sortSeries(
       cards.filter(function (c) {
         return !!c.memorial
@@ -3004,15 +3063,15 @@
       groups.push({
         kind: 'pool',
         key: 'pool:__memorial__',
-        label: '奇迹',
-        desc: '只有在「清空缓存」（重置存档）时才会赠送，无法通过抽卡获得',
+        label: '纪念',
+        desc: '无法抽卡获得：重置存档时赠送，或集齐指定系列后获得',
         coverUrl: '',
         coverCard: null,
         cover: coverOf(memorial),
         cards: memorial,
         children: [],
         flat: true,
-        note: '重置存档时赠送',
+        note: '重置赠送 · 集齐系列获得',
       })
     }
     // 兜底：哪个池子都不收的卡也必须看得见 —— 否则它们会在图鉴里**静默消失**。
@@ -3484,6 +3543,25 @@
         var dyn = dynamicMode() && !!c.dynamicUrl && hrUnlocked(c.id)
         holder.appendChild(cardFigure(c, { finish: finishFor(c.id), dynamic: dyn }))
         if (n > 0) holder.appendChild(el('div', { class: 'badge-owned', text: n > 1 ? '×' + n : '已获得' }))
+        /*
+         * 「集齐系列才有」的纪念卡：没拿到时把**还差多少**写在卡上。
+         *
+         * 不写的话这张卡与「重置就送」的纪念卡长得一模一样，读者只会以为
+         * 「重置一下就有了」—— 而它恰恰是重置**拿不到**的那一类。
+         */
+        if (n <= 0) {
+          var Sh = window.GachaShards
+          var need = Sh && typeof Sh.memorialRequirement === 'function' ? Sh.memorialRequirement(state.data, c, owned) : null
+          if (need) {
+            holder.appendChild(
+              el('div', {
+                class: 'badge-need',
+                text: '集齐' + need.series + ' ' + need.got + '/' + need.total,
+                title: '集齐「' + need.series + '」系列（共 ' + need.total + ' 张）后自动获得，并附赠全部特殊工艺；系列加新卡时会暂时回收',
+              })
+            )
+          }
+        }
         // 拥有的闪卡在格子上挂一个小标签，一眼能扫出「这张我有工艺版本」
         var ownedFin = ownedFoils(c.id)
         if (ownedFin.length) {
@@ -4891,22 +4969,40 @@
   /**
    * 纪念卡的持有情况。
    *
-   * 「缺不缺」的判据是**拥有数 < 数据里的纪念卡总数**，而不是写死 4 ——
-   * 作者后来又加过一张（奇迹·追加），写死数字的话加了新卡也永远不会提示。
-   * 列表本身走 page/shards.js 的 memorialCards（与服务端、导出同一套规则）。
+   * 🔑 **两类纪念卡的获取途径完全不同，必须分开算**（用户 2026-09-20 之后）：
+   *   · `reset`  —— 重置存档时赠送（奇迹系列）。「缺不缺」只按这一批判断：
+   *                公告弹窗承诺的是「重置会送全部 N 张」，把「集齐系列」的那张
+   *                算进来就等于**劝读者做一件没用的事**（重置完它立刻被回收）。
+   *   · `series` —— 集齐指定系列后获得，附带「还差几张」的进度。
    */
   function memorialStatus() {
     var S = window.GachaShards
     var all = S && typeof S.memorialCards === 'function' ? S.memorialCards(state.data) : []
+    var resetOnes = S && typeof S.resetMemorialCards === 'function' ? S.resetMemorialCards(state.data) : all
+    var seriesOnes = S && typeof S.seriesMemorialCards === 'function' ? S.seriesMemorialCards(state.data) : []
     var have = collection()
-    var owned = []
-    var missing = []
-    for (var i = 0; i < all.length; i++) {
-      var c = all[i]
-      if (Number(have[c.id] || 0) > 0) owned.push(c)
-      else missing.push(c)
+    var pick = function (list) {
+      var owned = []
+      var missing = []
+      for (var i = 0; i < list.length; i++) {
+        var c = list[i]
+        if (Number(have[c.id] || 0) > 0) owned.push(c)
+        else missing.push(c)
+      }
+      return { owned: owned, missing: missing }
     }
-    return { total: all.length, owned: owned, missing: missing }
+    var r = pick(resetOnes)
+    var series = seriesOnes.map(function (c) {
+      var need = S && typeof S.memorialRequirement === 'function' ? S.memorialRequirement(state.data, c, have) : null
+      return { card: c, owned: Number(have[c.id] || 0) > 0, progress: need }
+    })
+    return {
+      total: resetOnes.length,
+      owned: r.owned,
+      missing: r.missing,
+      series: series,
+      allTotal: all.length,
+    }
   }
 
   /**
@@ -4944,15 +5040,18 @@
     if (noticeSeen()) return false
 
     var st = memorialStatus()
-    if (!st.total) return false // 数据里一张纪念卡都没有（比如作者还没建）—— 不弹
-    if (!st.missing.length) return false // 已经集齐
+    if (!st.total) return false // 数据里一张「重置赠送」的纪念卡都没有 —— 不弹
+    if (!st.missing.length) return false // 重置那批已经集齐
 
     var e = state.els
     if (e.noticeTitle) e.noticeTitle.textContent = '你还没有集齐纪念卡'
     if (e.noticeLead) {
       e.noticeLead.textContent =
-        '本站共有 ' + st.total + ' 张纪念卡，你已拥有 ' + st.owned.length + ' 张。' +
-        '它们不在任何卡池里，也不能用碎片合成 —— 只能通过「清空缓存（重置存档）」赠送。'
+        '本站共有 ' + st.total + ' 张「重置赠送」的纪念卡，你已拥有 ' + st.owned.length + ' 张。' +
+        '它们不在任何卡池里，也不能用碎片合成 —— 只能通过「清空缓存（重置存档）」赠送。' +
+        (st.series.length
+          ? '（另有 ' + st.series.length + ' 张是**集齐指定系列**获得的，重置拿不到，见图鉴「纪念」分组。）'
+          : '')
     }
     if (e.noticeList) {
       clear(e.noticeList)
@@ -5585,7 +5684,7 @@
             '凌晨按下面的小时刷新（本地时间）。',
         }),
         field('启用签到', select(['true', 'false'], String(dailyCfg.enabled !== false), 'daily-on')),
-        field('每天基础点数', input('number', dailyCfg.points === undefined ? 300 : dailyCfg.points, 'daily-points')),
+        field('每天基础点数', input('number', dailyCfg.points === undefined ? 400 : dailyCfg.points, 'daily-points')),
         field('重抽次数（1 + 这个数 = 候选张数）', input('number', dailyCfg.rerolls === undefined ? 3 : dailyCfg.rerolls, 'daily-rerolls')),
         field('几点刷新（0~23）', input('number', dailyCfg.refreshHour === undefined ? 3 : dailyCfg.refreshHour, 'daily-hour')),
         el('div', { class: 'panel-sub', text: 'A：档位系数（只有下面这两档能被开出来）' }),
@@ -7429,7 +7528,12 @@
     if (e.pointsChip) {
       e.pointsChip.hidden = false
       e.pointsChip.textContent = fmt(points()) + ' 点数'
-      e.pointsChip.title = '普通抽卡每次消耗 1 点；每天登陆 +300（可累积）。追梦池花抽卡券'
+      // 提示里的数字**从配置读**，不写死：写死的 300 在用户把基础点数改成 400 之后
+      // 就变成了一句谎话（而且只在这条 tooltip 里，页面上根本看不见）
+      var dailyPts = window.Gacha && typeof window.Gacha.dailyConfig === 'function'
+        ? window.Gacha.dailyConfig(state.data).points
+        : 400
+      e.pointsChip.title = '普通抽卡每次消耗 1 点；每天签到 +' + dailyPts + '（可累积）。追梦池花抽卡券'
     }
 
     // 碎片总览：抽卡页与碎片页都显示，点得动（跳到碎片兑换）
@@ -7506,6 +7610,15 @@
 
     // 抽卡状态：从服务端快照或本地存储取
     state.sinceTop = Number(player().sinceTop || 0)
+
+    /*
+     * 每次渲染前对一次纪念卡（**不报喜**，见 syncMemorials 的注释）。
+     *
+     * 这条覆盖的是「**数据**变了、存档没动」的那一半条件：作者给「冥幽」加了几张
+     * 新卡，已经拿到纪念卡的人下次打开页面就该看到它被回收 —— 那一刻谁都没做写操作，
+     * 只有这条能兜住。静态站尤其重要：那边根本没有服务端帮忙对账。
+     */
+    syncMemorials()
 
     // 渲染任何一个板块抛错，都不该变成一页白屏。
     // 白屏最难查 —— 没有任何线索；把错误本身画出来，至少能立刻定位。

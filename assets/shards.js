@@ -403,12 +403,16 @@
         return { ok: false, error: '「' + (target.name || cardId) + '」已隐藏，不能合成' }
       }
       // 纪念卡**不能用碎片合成**（用户 2026-09-18 紧急要求）：
-      // 它们只在「清空缓存」重置存档时赠送。碎片若能换，就等于开了第二条获取途径，
-      // 而「只可通过此方式获取」正是这类卡的定义。
+      // 碎片若能换，就等于开了第二条获取途径，而「只可通过指定方式获取」正是这类卡的定义。
+      // 2026-09-20 起纪念卡有两种来源，提示语要按这张卡**实际**的来源说，
+      // 否则会指错路（让读者去重置一张重置拿不到的卡）。
       if (target.memorial) {
+        var how = target.memorialFor
+          ? '集齐「' + target.memorialFor + '」系列后自动获得（系列加新卡时会暂时回收）'
+          : '只能在「清空缓存」（重置存档）时获赠'
         return {
           ok: false,
-          error: '「' + (target.name || cardId) + '」是纪念卡 —— 纪念卡不能用碎片合成，只能在「清空缓存」（重置存档）时获赠',
+          error: '「' + (target.name || cardId) + '」是纪念卡 —— 不能用碎片合成，' + how,
         }
       }
       if (!target.rarityKnown) {
@@ -721,9 +725,17 @@
     var foils = {}
     var allFinishes = foilIds().slice()
     var cards = (data && data.cards) || []
+    /*
+     * ⚠️ 只赠送「重置就送」的那一批（`memorial` 有值、`memorialFor` 空）。
+     *
+     * 「集齐系列才有」的纪念卡（`memorialFor` 非空）**不能**在这里送：重置之后
+     * 一张卡都没有、系列当然没集齐，送了等于凭空发一张 —— 而且**领完立刻会被
+     * `reconcileMemorials` 回收**（用户要求：系列没集齐就没有它）。
+     * 两处规则不一致的症状是「重置完弹窗说送了，关掉弹窗卡就没了」。
+     */
     for (var i = 0; i < cards.length; i++) {
       var c = cards[i]
-      if (!c || !c.memorial) continue
+      if (!c || !c.memorial || c.memorialFor) continue
       owned[c.id] = 1
       if (allFinishes.length) foils[c.id] = allFinishes.slice()
       gift.push({ card: c, finishes: allFinishes.slice(), finish: allFinishes[allFinishes.length - 1] || '' })
@@ -760,6 +772,119 @@
     return out
   }
 
+  /**
+   * 纪念卡里「**重置存档就送**」的那一批（`memorialFor` 为空）。
+   *
+   * 公告弹窗只该拿这一批去判断「缺不缺」并承诺「重置会送全部 N 张」——
+   * 把「集齐系列才有」的卡也算进去，弹窗就会**骗人**：它会劝读者重置去领一张
+   * 重置完立刻被回收的卡。这是 2026-09-20 加 `memorialFor` 时最容易漏的一处。
+   */
+  function resetMemorialCards(data) {
+    var all = memorialCards(data)
+    var out = []
+    for (var i = 0; i < all.length; i++) if (!all[i].memorialFor) out.push(all[i])
+    return out
+  }
+
+  /** 纪念卡里「**集齐某个系列才给**」的那一批（`memorialFor` 非空） */
+  function seriesMemorialCards(data) {
+    var all = memorialCards(data)
+    var out = []
+    for (var i = 0; i < all.length; i++) if (all[i].memorialFor) out.push(all[i])
+    return out
+  }
+
+  /**
+   * 某个系列的收集进度（**唯一一份判据**：界面、服务端、回收/发放都用它）。
+   *
+   * 三件容易写错的事：
+   *   · **隐藏卡不算**（作者把一张卡设为隐藏 = 不想让它出现，不该卡住收集）；
+   *   · **纪念卡不算**（它们本来就不进任何池子，抽不到，算进去就永远集不齐）；
+   *   · **`owned > 0` 就算拥有**（重复张数不影响「集齐」，多抽几张不该更容易集齐）。
+   * 系列里一张可收集的卡都没有时 `complete` 是 **false**（不是 true）——
+   * 「空集合算完整」会让一张系列名写错的纪念卡直接白送。
+   */
+  function seriesProgress(data, series, ownedMap) {
+    var name = String(series == null ? '' : series)
+    var owned = ownedMap || {}
+    var cards = (data && data.cards) || []
+    var total = 0
+    var got = 0
+    for (var i = 0; i < cards.length; i++) {
+      var c = cards[i]
+      if (!c || c.hidden || c.memorial) continue
+      if (String(c.series || '') !== name) continue
+      total++
+      if (Number(owned[c.id] || 0) > 0) got++
+    }
+    return { series: name, total: total, got: got, complete: total > 0 && got >= total }
+  }
+
+  /**
+   * 某张纪念卡的获取条件。返回 `null` = 这张不是「集齐系列」类的纪念卡。
+   * 界面用它画「集齐「冥幽」系列 3/5」这类提示。
+   */
+  function memorialRequirement(data, card, ownedMap) {
+    if (!card || !card.memorial || !card.memorialFor) return null
+    var owned = ownedMap || (data && data.player && data.player.owned) || {}
+    return seriesProgress(data, card.memorialFor, owned)
+  }
+
+  /**
+   * 把「集齐系列才有」的纪念卡**对齐到当前收集状态**（纯函数，就地改 `data.player`）。
+   *
+   * 用户 2026-09-20：「在收集完成『冥幽』系列之后领取。如果后续『冥幽』系列推出
+   * 新的卡片，则纪念卡会被回收，在重新收集完成时再次获得。」
+   *
+   * 这是一个**双向**判定，不是一个一次性发奖：
+   *   · 系列集齐了、卡还没有 -> **发放**（`owned` +1，并附赠**全部**特殊工艺）
+   *   · 系列没集齐、卡却有   -> **回收**（连同它的工艺一起删掉）
+   * 所以它必须在**三处**都跑：服务端每次写存档之后、服务端每次下发状态之前
+   *（系列扩编是改数据、不是改存档，只挂在写路径上会漏掉）、以及客户端本地记账之后。
+   *
+   * @returns {{changed:boolean, granted:Array, revoked:Array, owned:Object, foils:Object}}
+   *          `granted`/`revoked` 里的每一项是 `{ card, progress }`，供界面报喜/说明。
+   */
+  function reconcileMemorials(data) {
+    var player = data && data.player
+    var quiet = { changed: false, granted: [], revoked: [], owned: {}, foils: {} }
+    if (!player || typeof player !== 'object') return quiet
+
+    var owned = {}
+    var srcOwned = player.owned && typeof player.owned === 'object' ? player.owned : {}
+    for (var k in srcOwned) if (Object.prototype.hasOwnProperty.call(srcOwned, k)) owned[k] = srcOwned[k]
+    var foils = {}
+    var srcFoils = player.foils && typeof player.foils === 'object' ? player.foils : {}
+    for (var fk in srcFoils) if (Object.prototype.hasOwnProperty.call(srcFoils, fk)) foils[fk] = srcFoils[fk]
+
+    var all = foilIds().slice()
+    var granted = []
+    var revoked = []
+    var list = seriesMemorialCards(data)
+    for (var i = 0; i < list.length; i++) {
+      var card = list[i]
+      var p = seriesProgress(data, card.memorialFor, owned)
+      var has = Number(owned[card.id] || 0) > 0
+      if (p.complete && !has) {
+        owned[card.id] = 1
+        // 「纪念卡的赠送同样会附赠所有特殊工艺」（用户 2026-09-20）
+        if (all.length) foils[card.id] = all.slice()
+        granted.push({ card: card, progress: p })
+      } else if (!p.complete && has) {
+        delete owned[card.id]
+        delete foils[card.id]
+        revoked.push({ card: card, progress: p })
+      }
+    }
+
+    var changed = granted.length > 0 || revoked.length > 0
+    if (changed) {
+      player.owned = owned
+      player.foils = foils
+    }
+    return { changed: changed, granted: granted, revoked: revoked, owned: owned, foils: foils }
+  }
+
   var api = {
     DEFAULTS: DEFAULTS,
     TICKET_DEFAULTS: TICKET_DEFAULTS,
@@ -775,6 +900,11 @@
     resetGift: resetGift,
     resetPlayer: resetPlayer,
     memorialCards: memorialCards,
+    resetMemorialCards: resetMemorialCards,
+    seriesMemorialCards: seriesMemorialCards,
+    seriesProgress: seriesProgress,
+    memorialRequirement: memorialRequirement,
+    reconcileMemorials: reconcileMemorials,
     ticketRules: ticketRules,
     ticketStatus: ticketStatus,
     canExchangeTickets: canExchangeTickets,

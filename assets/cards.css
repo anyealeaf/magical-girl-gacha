@@ -252,6 +252,7 @@
 .badge-guarantee,
 .badge-note,
 .badge-owned,
+.badge-need,
 .badge-locked {
   position: absolute;
   z-index: 6;
@@ -299,6 +300,18 @@
   right: -2px;
   background: var(--ok);
   color: #fff;
+}
+
+/* 「集齐系列才有」的纪念卡：还没拿到时说明**还差多少**（见 page.js 的 groupBody）。
+   与 `.badge-note` 同一个位置（卡片下缘居中），但用中性的蓝灰，避免读成「出错了」。 */
+.badge-need {
+  bottom: 34px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #2b3550;
+  color: #cfd8ea;
+  border: 1px solid rgba(207, 216, 234, 0.45);
+  white-space: nowrap;
 }
 
 .badge-locked {
