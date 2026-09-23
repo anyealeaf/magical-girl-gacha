@@ -298,6 +298,129 @@
   }
 
   // -------------------------------------------------------------------------
+  // UR 保底（用户 2026-09-22）
+  // -------------------------------------------------------------------------
+  //
+  // 原话：「在普通池和追梦池中都添加 UR 保底机制，抽到重复 UR 之后，下一张 UR 必定为
+  //   未拥有（已经集齐所有 UR 的话就不生效）」。
+  //
+  // 与 SP 保底的关系：**同一种形状的第二个开关**，但触发方式不同 ——
+  // SP 是作者手动打开的全局开关，UR 是**自动**的、由「抽到重复 UR」触发。
+  // 两者共用 `ownedIds` 与同一条硬约束（移出去之后这一档必须还有卡）。
+  //
+  // 状态存在 `player.urPity[poolId]`，**按池子记**（与 `spPity` 一致）：
+  // 判据是「你的收集里还有哪些 UR 没拿到」，这件事与用点数抽还是用券抽无关，
+  // 所以同一个池子的普通模式与追梦模式**共用**这份状态 —— 这正是用户那句
+  // 「普通池和追梦池中都添加」的意思（两边都生效，而不是各记一份）。
+
+  /** UR 这一档的档位 id。**写死 'UR'**（用户说的就是 UR，不是「最高档」）。*/
+  var UR_PITY_RARITY = 'UR'
+
+  /** 这个池子的 UR 保底现在挂着吗（`player.urPity[poolId]`） */
+  function urPityActive(data, poolId) {
+    var m = data && data.player && data.player.urPity
+    if (!m || typeof m !== 'object') return false
+    return !!m[poolId]
+  }
+
+  /** 本池的 UR 档里全部卡 id */
+  function urBucket(data, pool) {
+    return indexes(data, pool).byRarity[UR_PITY_RARITY] || []
+  }
+
+  /**
+   * 现在该把哪些 UR 移出这一档（= 已经拥有的那些）。
+   *
+   * 三条前置：① 保底挂着 ② 抽的正是 UR 档 ③ 移出之后这一档还有卡。
+   * 第 ③ 条是硬约束：全被移走的话 UR 就再也抽不出来了 —— 那比抽到重复更糟。
+   * （「已经集齐所有 UR 的话就不生效」在数据上的表现就是这一条。）
+   *
+   * @param {object} [state] 本轮工作状态 `{ active, owned }`，理由与 `spExclusions` 相同：
+   *   同一轮十连里刚抽到的 UR 也已经是「已有」，只看持久化那份会在同一轮里重复。
+   */
+  function urExclusions(data, pool, bucket, rarityId, state) {
+    state = state || {}
+    var active = state.active === undefined ? urPityActive(data, pool && pool.id) : !!state.active
+    if (!active) return []
+    if (String(rarityId) !== UR_PITY_RARITY) return []
+    var owned = ownedIds(data && data.player)
+    if (state.owned) {
+      for (var k in state.owned) {
+        if (state.owned[k]) owned[k] = 1
+      }
+    }
+    var out = []
+    for (var i = 0; i < bucket.length; i++) {
+      if (owned[bucket[i]]) out.push(bucket[i])
+    }
+    // 一个都没拥有 -> 没什么可移的；全拥有 -> 移完就空了，绝对不能移
+    if (!out.length || out.length >= bucket.length) return []
+    return out
+  }
+
+  /**
+   * 抽完之后 UR 保底的状态（**纯函数**，与 `spPityAfter` 同构）。
+   *
+   * 逐张重放，所以同一轮十连里也立刻生效：
+   *   · 保底挂着 + 又抽到 UR      -> 关掉（承诺已经兑现：这一张保证是新的）
+   *   · 保底没挂 + 抽到**已有** UR -> 打开（前提：本池还有未拥有的 UR）
+   *   · 抽到新的 UR              -> 什么都不做
+   *
+   * 「已经集齐所有 UR 的话就不生效」= 打开之前先看一眼还有没有未拥有的 UR；
+   * 一张都没有（或全被移出去）就不打开 —— 那时候重复是必然的，挂着一个永远
+   * 兑现不了的保底只会让界面一直显示「下一张必为未拥有」。
+   */
+  function urPityAfter(data, pool, results) {
+    var all = urBucket(data, pool)
+    var owned = ownedIds(data && data.player)
+    var active = urPityActive(data, pool && pool.id)
+    var changed = false
+    for (var i = 0; i < results.length; i++) {
+      var one = results[i]
+      if (!one || !one.card || String(one.rarityId) !== UR_PITY_RARITY) continue
+      var wasOwned = !!owned[one.card.id]
+      owned[one.card.id] = 1
+      if (active) {
+        active = false
+        changed = true
+        continue
+      }
+      if (!wasOwned) continue
+      // 还有没拿到的 UR 吗？（含「移出去之后这一档还有卡」这条硬约束）
+      var fresh = 0
+      for (var k = 0; k < all.length; k++) if (!owned[all[k]]) fresh++
+      if (fresh > 0) {
+        active = true
+        changed = true
+      }
+    }
+    return { active: active, changed: changed, owned: owned }
+  }
+
+  /**
+   * 把某一池的 UR 保底开关并进整张表（**纯函数**）。
+   *
+   * 表里只保留「真的存在的池子 + 真值」：拼错的池 id / `false` 留着不会报错，
+   * 只会让某个池子的保底永远打不开或永远关不掉（与 spPity 同一条纪律）。
+   */
+  function urPityNextTable(data, pool, active) {
+    var out = {}
+    var src = (data && data.player && data.player.urPity) || {}
+    var known = {}
+    var pools = (data && data.pools) || []
+    for (var i = 0; i < pools.length; i++) known[pools[i].id] = 1
+    for (var k in src) {
+      if (!known[k]) continue
+      if (src[k]) out[k] = true
+    }
+    if (pool && pool.id && known[pool.id]) {
+      if (active) out[pool.id] = true
+      else delete out[pool.id]
+    }
+    return out
+  }
+
+  // -------------------------------------------------------------------------
   // 特殊工艺（闪卡）
   // -------------------------------------------------------------------------
   //
@@ -867,6 +990,20 @@
       bucket2 = kept
     }
 
+    /*
+     * UR 保底：把已拥有的 UR 临时移出这一档（用户 2026-09-22）。
+     * 与 SP 那条互不干扰 —— 判据是档位 id（SP 认最高档、UR 写死 'UR'），
+     * 一次抽卡只会命中其中一条。放在 SP 之后只是为了让两条规则的顺序固定下来。
+     */
+    var excludedUr = urExclusions(data, pool, bucket2, rarityId, opts._ur)
+    if (excludedUr.length) {
+      var keptUr = []
+      for (var e2 = 0; e2 < bucket2.length; e2++) {
+        if (excludedUr.indexOf(bucket2[e2]) < 0) keptUr.push(bucket2[e2])
+      }
+      bucket2 = keptUr
+    }
+
     // 同档位内等概率。若之后要「同档内不同权重」，改这一行即可。
     var pickId = bucket2[Math.floor(rng() * bucket2.length) % bucket2.length]
     var card = idx.byId[pickId]
@@ -931,9 +1068,12 @@
       //（用户原话：「暂时移出当前卡池，直到下一次 SP 抽出来才移回来」）。
       // 用 `spPityAfter` 重放前缀而不是自己维护一个可变状态：这套规则只有一份实现。
       var mid = spPityAfter(data, pool, results)
+      // UR 保底同理：同一轮十连里抽到重复 UR 之后，后面的 UR 立刻只看未拥有的那些
+      var midUr = urPityAfter(data, pool, results)
       var one = drawSingle(data, poolId, {
         rng: rng,
         _sp: { active: mid.active, owned: mid.owned },
+        _ur: { active: midUr.active, owned: midUr.owned },
         dream: dreamOn,
         dreamSteps: dSteps,
       })
@@ -960,10 +1100,12 @@
       if (best < guaranteeRank) {
         // 保底替换也要带上本轮的工作状态 —— 否则它等于「忘了这一轮抽过什么」
         var guaranteeSp = spPityAfter(data, pool, results)
+        var guaranteeUr = urPityAfter(data, pool, results)
         var forced = drawSingle(data, poolId, {
           rng: rng,
           _forceRarity: guarantee,
           _sp: { active: guaranteeSp.active, owned: guaranteeSp.owned },
+          _ur: { active: guaranteeUr.active, owned: guaranteeUr.owned },
           dream: dreamOn,
           dreamSteps: dSteps,
         })
@@ -1030,6 +1172,8 @@
     // ⚠️ 必须在十连保底**换掉最后一张之后**再算：那张卡到底算不算「抽到过」，
     // 结论会不一样。重放一遍是纯函数，比在循环里小心翼翼地回滚可靠得多。
     var spAfter = spPityAfter(data, pool, results)
+    // UR 保底同理：同样在保底替换之后再重放一遍，结论才与最终结果一致
+    var urAfter = urPityAfter(data, pool, results)
 
     // 追梦计数：同样在保底替换之后再重放一遍，结论才和最终结果一致
     var dreamAfter = dreamOn ? dreamStepsAfter(data, pool, opts.dreamSteps === undefined ? dreamSteps(data, pool.id) : opts.dreamSteps, results) : null
@@ -1040,6 +1184,11 @@
       poolId: pool.id,
       dream: dreamOn,
       spPity: { active: spAfter.active, changed: spAfter.changed },
+      /**
+       * UR 保底（用户 2026-09-22）：`table` 是**整张表**，调用方直接持久化
+       *（与 spPity 一样，服务端只负责按真实池子校验后原样落盘）。
+       */
+      urPity: { active: urAfter.active, changed: urAfter.changed, table: urPityNextTable(data, pool, urAfter.active) },
       dreamSteps: dreamAfter ? dreamAfter.steps : null,
       dreamReset: dreamAfter ? dreamAfter.reset : false,
       /** 红碎补偿：这一轮兑现了哪些欠条（空数组 = 没有欠条或没兑现） */
@@ -1670,8 +1819,114 @@
     return { ok: true, hr: hr, shards: shards, cost: check.cost, cardId: cardId }
   }
 
-  /** 卡池概况：每档多少张、总共有多少张可抽。给「卡池一览」用。 */
-  function poolSummary(data, poolId) {
+  // ---------------------------------------------------------------------------
+  // 红碎兑换：拥有全闪之后，用 HR 碎片直接换这张卡的红碎工艺（用户 2026-09-22）
+  // ---------------------------------------------------------------------------
+  //
+  // 原话：「在拥有相应卡牌的全闪工艺 UR/SP 之后，可以在图鉴中点开大图之后，
+  //   点击红碎按钮，消耗 30/50 点 HR 碎片兑换对应的红碎工艺」。
+  //
+  // 拆开来是四条硬约束（少一条都会变成「点得动但换错东西」）：
+  //   ① 只对 UR / SP（`???`）开放 —— 其余档位连红碎门槛都够不到（见 FOIL_KINDS）
+  //   ② **必须已经拥有这张卡的全闪**（这正是用户说的前置条件）
+  //   ③ 还没拥有红碎（否则就是花 30 个碎片买一张已经有的工艺）
+  //   ④ HR 碎片够（30 for UR / 50 for SP，可配）
+
+  /** 红碎兑换的价目表（与 lib/data.js 的 defaultHr().shatterCost 保持一致） */
+  var SHATTER_COST_DEFAULTS = { UR: 30, '???': 50 }
+
+  /**
+   * 红碎兑换配置。
+   *
+   * `enabled` 跟 HR 的总开关走（关掉 HR 就两种兑换一起关），`shatterCost` 按档位配。
+   * 价目表里**没有这个档位** = 这个档位不开放兑换（而不是「用默认价」）——
+   * 默认价只用于 `UR` / `???` 这两个键缺失时，SR/SSR 这类档位不该被顺手放进来。
+   */
+  function shatterExchangeConfig(data) {
+    var cfg = (data && data.settings && data.settings.hr) || {}
+    var raw = cfg.shatterCost && typeof cfg.shatterCost === 'object' ? cfg.shatterCost : {}
+    var cost = {}
+    for (var k in SHATTER_COST_DEFAULTS) {
+      if (!Object.prototype.hasOwnProperty.call(SHATTER_COST_DEFAULTS, k)) continue
+      var v = raw[k]
+      var n = Math.floor(Number(v === undefined ? SHATTER_COST_DEFAULTS[k] : v))
+      cost[k] = Number.isFinite(n) && n > 0 ? n : SHATTER_COST_DEFAULTS[k]
+    }
+    return { enabled: cfg.enabled !== false, cost: cost }
+  }
+
+  /** 这张卡现在拥有哪些工艺（只留认识的 id） */
+  function hasFoil(player, cardId, foilId) {
+    var list = ((player && player.foils) || {})[cardId]
+    if (!Array.isArray(list)) return false
+    for (var i = 0; i < list.length; i++) {
+      if (String(list[i]) === String(foilId)) return true
+    }
+    return false
+  }
+
+  /**
+   * 能不能兑换这张卡的红碎。**每一种「不能」都要分开说**（与 `canUnlockHr` 同一条纪律）：
+   * 都糊成「不能兑换」的话，读者会以为是碎片不够，而真正的原因可能是他还没抽到全闪。
+   */
+  function canExchangeShatter(data, cardId) {
+    var cfg = shatterExchangeConfig(data)
+    var card = cardOf(data, cardId)
+    var p = (data && data.player) || {}
+    var have = Math.max(0, Math.floor(Number(((p.shards) || {})[HR_SHARD_RARITY] || 0)))
+    var cost = card ? cfg.cost[String(card.rarity)] : undefined
+    if (!cfg.enabled) return { ok: false, reason: 'HR 碎片的兑换已关闭', have: have }
+    if (!card) return { ok: false, reason: '名册里没有这张卡', have: have }
+    if (cost === undefined) {
+      return {
+        ok: false,
+        reason: '只有 UR / SP 能用这种方式换红碎（这张是 ' + String(card.rarity || '未设档位') + '）',
+        have: have,
+      }
+    }
+    if (!hasFoil(p, cardId, 'full')) {
+      return { ok: false, reason: '要先拥有这张卡的**全闪**才能兑换红碎（现在还没有全闪）', have: have, cost: cost, needFull: true }
+    }
+    if (hasFoil(p, cardId, 'shatter')) {
+      return { ok: false, reason: '这张卡的红碎已经有了', have: have, cost: cost, owned: true }
+    }
+    if (have < cost) return { ok: false, reason: 'HR 碎片不够（还差 ' + (cost - have) + ' 个）', have: have, cost: cost }
+    return { ok: true, cost: cost, have: have, card: card }
+  }
+
+  /**
+   * 兑换之后的新状态（纯函数）：`{ ok, foils, shards, cost, cardId }`。
+   *
+   * **原子性**与 `hrUnlockAfter` 一致：先扣碎片再加工艺，扣不出来就整笔不做 ——
+   * 半个状态（碎片扣了、工艺没加上）在界面上看不出来。
+   */
+  function shatterExchangeAfter(data, cardId) {
+    var check = canExchangeShatter(data, cardId)
+    if (!check.ok) return { ok: false, reason: check.reason }
+    var p = (data && data.player) || {}
+    var shards = Object.assign({}, (p.shards) || {})
+    var left = Math.max(0, Math.floor(Number(shards[HR_SHARD_RARITY] || 0)) - check.cost)
+    if (left > 0) shards[HR_SHARD_RARITY] = left
+    else delete shards[HR_SHARD_RARITY]
+
+    var foils = {}
+    var src = (p.foils) || {}
+    for (var k in src) if (Object.prototype.hasOwnProperty.call(src, k)) foils[k] = Array.isArray(src[k]) ? src[k].slice() : []
+    var mine = foils[cardId] || []
+    // 去重后按 FOIL_IDS 的固定顺序放：界面上的工艺标签顺序不该随机
+    var set = {}
+    for (var i = 0; i < mine.length; i++) set[String(mine[i])] = 1
+    set.shatter = 1
+    var next = []
+    for (var f = 0; f < FOIL_IDS.length; f++) if (set[FOIL_IDS[f]]) next.push(FOIL_IDS[f])
+    // 不认识的工艺 id 原样留着（不该由这里悄悄删掉别人的数据）
+    for (var m in set) if (FOIL_IDS.indexOf(m) < 0) next.push(m)
+    foils[cardId] = next
+
+    return { ok: true, foils: foils, shards: shards, cost: check.cost, cardId: cardId, card: check.card }
+  }
+
+  /** 卡池概况：每档多少张、总共有多少张可抽。给「卡池一览」用。 */  function poolSummary(data, poolId) {
     var rarities = (data && data.rarities) || []
     var cards = (data && data.cards) || []
     var pools = (data && data.pools) || []
@@ -1851,6 +2106,17 @@
     hasHr: hasHr,
     canUnlockHr: canUnlockHr,
     hrUnlockAfter: hrUnlockAfter,
+    // 红碎兑换：拥有全闪之后，用 HR 碎片换这张卡的红碎工艺（用户 2026-09-22）
+    shatterExchangeConfig: shatterExchangeConfig,
+    hasFoil: hasFoil,
+    canExchangeShatter: canExchangeShatter,
+    shatterExchangeAfter: shatterExchangeAfter,
+    // UR 保底：抽到重复 UR 之后，下一张 UR 必定未拥有（用户 2026-09-22）
+    UR_PITY_RARITY: UR_PITY_RARITY,
+    urPityActive: urPityActive,
+    urExclusions: urExclusions,
+    urPityAfter: urPityAfter,
+    urPityNextTable: urPityNextTable,
     cardOf: cardOf,
     poolSummary: poolSummary,
     rateTable: rateTable,

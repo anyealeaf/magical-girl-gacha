@@ -470,6 +470,8 @@
         duplicates: 0,
         // 与服务端同名：卡池 id -> true（SP 保底开关，见 draw.js 的 spPityAfter）
         spPity: {},
+        // 与服务端同名：卡池 id -> true（UR 保底，见 draw.js 的 urPityAfter）
+        urPity: {},
         // 与服务端同名：卡牌 id -> 拥有的特殊工艺数组（见 draw.js 的 foilsAfter）
         foils: {},
       }
@@ -489,6 +491,13 @@
       var kept = {}
       for (var pk in s.spPity) if (s.spPity[pk]) kept[pk] = true
       s.spPity = kept
+    }
+    // UR 保底：与 spPity 同一种形状、同一条纪律（只留真值）
+    if (!s.urPity || typeof s.urPity !== 'object') s.urPity = {}
+    else {
+      var keptU = {}
+      for (var uk in s.urPity) if (s.urPity[uk]) keptU[uk] = true
+      s.urPity = keptU
     }
     // 工艺拥有表：只留认识的工艺 id，去重（拼错的留着不会报错，
     // 只会让「这张卡到底有没有闪」永远判错）
@@ -610,6 +619,12 @@
     if (patch.sinceTop !== undefined) p.sinceTop = Number(patch.sinceTop || 0)
     if (patch.history) p.history = patch.history
     if (patch.spPity) p.spPity = patch.spPity
+    /*
+     * UR 保底：漏了这一行的症状是「刚抽到重复 UR，界面还说下一张不会保底」，
+     * 而且同一轮之后的抽卡会重新按「未保底」算 —— 也就是保底**时灵时不灵**。
+     * 与 spPity 一样，`patch.urPity` 允许是空表（表示「保底关掉了」）。
+     */
+    if (patch.urPity) p.urPity = patch.urPity
     if (patch.foils) p.foils = patch.foils
     // 追梦计数与券数：追梦池要靠它算「SP 涨到多少了」，换券之后券数也要立刻可见
     if (patch.dream) p.dream = patch.dream
@@ -711,6 +726,7 @@
         duplicates: Number(p.duplicates || 0),
         sinceTop: Number(p.sinceTop || 0),
         spPity: p.spPity || {},
+        urPity: p.urPity || {},
         foils: p.foils || {},
         dream: p.dream || {},
         currency: Number(p.currency || 0),
@@ -2287,6 +2303,17 @@
     if (spAfter.active) local.spPity[pool.id] = true
     else delete local.spPity[pool.id]
 
+    /*
+     * UR 保底：结论同样由 draw.js 的纯函数给出（用户 2026-09-22）。
+     * 与服务端共享同一条规则，但与 spPity 有一个区别：`result.urPity.table` 是
+     * **整张表**（含别的池子）—— 直接落盘即可，别在这里重新拼一张表出来
+     * （拼的话就又出现了「两份实现」）。
+     */
+    var urAfter = result.urPity || { active: false, changed: false, table: null }
+    local.urPity = urAfter.table && typeof urAfter.table === 'object'
+      ? Object.assign({}, urAfter.table)
+      : Object.assign({}, local.urPity || {})
+
     // 特殊工艺：把这一轮抽到的工艺记进「已拥有」。合并规则也在 draw.js 里
     //（foilsAfter 是纯函数），服务端同步时用的是同一份。
     var G2 = G()
@@ -2338,6 +2365,7 @@
       sinceTop: local.sinceTop,
       history: local.history,
       spPity: local.spPity,
+      urPity: local.urPity,
       foils: local.foils,
       dream: local.dream,
       shatterPity: local.shatterPity,
@@ -2520,6 +2548,8 @@
           sinceTop: sinceTop,
           // SP 保底开关按池子记，服务端没有别的来源 —— 整张表送上去
           spPity: local.spPity,
+          // UR 保底同理（用户 2026-09-22 加的这一条）
+          urPity: local.urPity || {},
           // 追梦计数同理（服务端不判抽卡，只记账）
           dream: local.dream || {},
           // 红碎补偿的欠条：与 spPity 同理，**整张表**送上去（服务端不判抽卡，
@@ -2659,6 +2689,19 @@
               class: 'pill pill-pity',
               text: 'SP 保底：下次出 SP 必是新卡',
               title: '你已经抽到过重复的 SP，而本池的 SP 还没集齐 —— 已拥有的 SP 暂时不在抽取范围内，直到下次抽出 SP 为止',
+            })
+          : null,
+        /*
+         * UR 保底（用户 2026-09-22）：挂着的时候必须说出来 ——
+         * 否则读者只会发现「这几张 UR 怎么突然都抽不到了/抽到的都是新的」，
+         * 而原因（他上一张 UR 是重复的）只有界面能告诉他。
+         * 与 SP 那条同一套判据：走 dataWithState()，静态站才读得到本机状态。
+         */
+        pool && g && typeof g.urPityActive === 'function' && g.urPityActive(dataWithState(), pool.id)
+          ? el('span', {
+              class: 'pill pill-pity',
+              text: 'UR 保底：下次出 UR 必是新卡',
+              title: '你抽到过重复的 UR，而本池还有没拿到的 UR —— 已有的 UR 暂时不在抽取范围内，直到下次抽出 UR（或本池 UR 全部集齐）为止',
             })
           : null,
         // 红碎补偿的欠条：欠着就写清楚「下次十连必出哪一档的红碎」——
@@ -3936,6 +3979,11 @@
   function hrShardPanel() {
     var g = G()
     var cfg = g && typeof g.hrConfig === 'function' ? g.hrConfig(dataWithState()) : { enabled: true, shards: 20 }
+    // 红碎兑换的价目（UR / SP 两档）—— 提示语里要报出来，否则读者不知道要攒多少
+    var shatterCost =
+      g && typeof g.shatterExchangeConfig === 'function'
+        ? g.shatterExchangeConfig(dataWithState()).cost
+        : { UR: 30, '???': 50 }
     var cards = hrCards()
     var have = Math.max(0, Number((shards() || {})[HR_SHARD_KEY] || 0))
     /**
@@ -3996,6 +4044,18 @@
           }),
       el('div', { class: 'hr-rows' }, rows),
       have >= cfg.shards || !cards.length ? null : el('p', { class: 'panel-hint', text: '还差 ' + fmt(cfg.shards - have) + ' 个碎片才能换第一张。' }),
+      /*
+       * 红碎兑换的说明（用户 2026-09-22）。它不复用上面那张「有动态卡面」的表 ——
+       * 两个用途的候选卡片是完全不同的两批（一个是配了视频的卡，一个是「已经抽到全闪
+       * 的 UR/SP」），混在一张表里读者会以为换红碎也必须先有动态卡面。
+       */
+      el('p', {
+        class: 'panel-hint',
+        text:
+          'HR 碎片还有第二个用途：**红碎兑换** —— 拥有某张 UR/SP 的' + foilLabel('full') +
+          '之后，可以在图鉴里点开它的大图，用 ' + fmt(shatterCost.UR) + '（UR）/ ' +
+          fmt(shatterCost['???']) + '（SP）个 HR 碎片直接换它的' + foilLabel('shatter') + '工艺。',
+      }),
     ])
   }
 
@@ -4383,6 +4443,8 @@
           sinceTop: player.sinceTop,
           history: player.history,
           spPity: player.spPity,
+          // 重置之后「下一张 UR 必为未拥有」也一并归零（resetPlayer 给的是一张空表）
+          urPity: player.urPity,
           foils: player.foils,
           dream: player.dream,
           currency: player.currency,
@@ -4929,6 +4991,8 @@
     local.duplicates = 0
     // SP 保底开关也是玩家状态的一部分：收集进度清了，保底自然也该回到初始
     local.spPity = {}
+    // UR 保底同理（不一起清的话，重置之后第一张 UR 会被一条没有来源的保底顶掉）
+    local.urPity = {}
     saveLocal(local)
     state.last = null
     state.sinceTop = 0
@@ -4941,6 +5005,7 @@
       sinceTop: local.sinceTop,
       history: local.history,
       spPity: local.spPity,
+      urPity: local.urPity,
     })
 
     function done() {
@@ -5669,6 +5734,8 @@
     // --- 每日签到 / HR / 重复闪卡返还（用户 2026-09-19 那一批）-------------
     var dailyCfg = s.daily || {}
     var hrCfg2 = s.hr || {}
+    // 红碎兑换价（按档位）：缺字段时用 30 / 50（与 lib/data.js 的 defaultHr 一致）
+    var shatterCostCfg = hrCfg2.shatterCost && typeof hrCfg2.shatterCost === 'object' ? hrCfg2.shatterCost : {}
     var dupCfg = s.dupReward || {}
     var rf = dailyCfg.rarityFactor || {}
     var ff = dailyCfg.foilFactor || {}
@@ -5703,6 +5770,14 @@
         }),
         field('兑换一张动态卡面要几个 HR 碎片', input('number', hrCfg2.shards === undefined ? 20 : hrCfg2.shards, 'hr-shards')),
         field('启用 HR 兑换', select(['true', 'false'], String(hrCfg2.enabled !== false), 'hr-on')),
+        el('p', {
+          class: 'panel-hint',
+          text:
+            '红碎兑换：拥有某张 UR/SP 的**全闪**之后，可以在图鉴大图里花 HR 碎片直接换它的红碎工艺。' +
+            '（用户 2026-09-22：「消耗 30/50 点 HR 碎片兑换对应的红碎工艺」。）',
+        }),
+        field('换 UR 的红碎要几个 HR 碎片', input('number', shatterCostCfg.UR === undefined ? 30 : shatterCostCfg.UR, 'shatter-cost-ur')),
+        field('换 SP 的红碎要几个 HR 碎片', input('number', shatterCostCfg['???'] === undefined ? 50 : shatterCostCfg['???'], 'shatter-cost-sp')),
         el('p', {
           class: 'panel-hint',
           text:
@@ -6071,6 +6146,8 @@
           ['daily-b-full', 'B · ' + foilLabel('full')],
           ['daily-b-shatter', 'B · ' + foilLabel('shatter')],
           ['hr-shards', '兑换动态卡面要几个 HR 碎片'],
+          ['shatter-cost-ur', '换 UR 的红碎要几个 HR 碎片'],
+          ['shatter-cost-sp', '换 SP 的红碎要几个 HR 碎片'],
           ['dup-flat-points', '重复面闪额外返几点'],
           ['dup-full-hr', '重复全闪额外返几个 HR 碎片'],
         ]
@@ -6089,6 +6166,10 @@
         }
         if (vals['hr-shards'] < 1) {
           window.alert('兑换动态卡面的碎片数至少要 1（现在是 ' + vals['hr-shards'] + '）')
+          return
+        }
+        if (vals['shatter-cost-ur'] < 1 || vals['shatter-cost-sp'] < 1) {
+          window.alert('红碎兑换的碎片数至少要 1（现在是 UR ' + vals['shatter-cost-ur'] + ' / SP ' + vals['shatter-cost-sp'] + '）')
           return
         }
         var dailyOn = q('daily-on')
@@ -6118,7 +6199,12 @@
                 shatter: vals['daily-b-shatter'],
               },
             },
-            hr: { enabled: hrOn ? hrOn.value !== 'false' : true, shards: vals['hr-shards'] },
+            hr: {
+              enabled: hrOn ? hrOn.value !== 'false' : true,
+              shards: vals['hr-shards'],
+              // 红碎兑换价（按档位）。只送这两个档 —— 别的档位本来就不开放兑换
+              shatterCost: { UR: vals['shatter-cost-ur'], '???': vals['shatter-cost-sp'] },
+            },
             dupReward: { enabled: true, flatPoints: vals['dup-flat-points'], fullHrShards: vals['dup-full-hr'] },
           },
         })
@@ -7270,6 +7356,105 @@
     toast('已解锁动态卡面（花掉 ' + after.cost + ' 个 HR 碎片）', 'ok')
   }
 
+  /**
+   * 大图里的「兑换红碎工艺」按钮（用户 2026-09-22）。
+   *
+   * 原话：「在拥有相应卡牌的全闪工艺 UR/SP 之后，可以在图鉴中点开大图之后，
+   *   点击红碎按钮，消耗 30/50 点 HR 碎片兑换对应的红碎工艺」。
+   *
+   * 判定全部走 `page/draw.js` 的 `canExchangeShatter`（与服务端 `POST api/player/shatter`
+   * 同一份规则）。四种「不能换」要分开说：不是 UR/SP / 还没有全闪 / 已经有红碎了 /
+   * 碎片不够 —— 糊成一句「不能兑换」的话，作者会以为是碎片不够。
+   */
+  function paintShatterButton(card) {
+    var btn = state.els.cardDialogShatter
+    if (!btn) return
+    var g = G()
+    var check = g && typeof g.canExchangeShatter === 'function' ? g.canExchangeShatter(dataWithState(), card && card.id) : null
+
+    // ① 连规则模块都没有：直接说清，别让按钮看起来能点
+    if (!check) {
+      btn.hidden = !(card && card.rarity === 'UR')
+      if (!btn.hidden) {
+        btn.disabled = true
+        btn.textContent = '规则模块没加载，无法兑换红碎'
+      }
+      return
+    }
+    /*
+     * ② 按钮什么时候**出现**：只有「这个档位开放红碎兑换」的卡才给它位置。
+     *    已经拥有红碎的卡不显示（没什么可换的），但**要留一个角标**告诉读者
+     *    「这张的红碎是靠这个方式来的」—— 否则他会以为按钮坏了。
+     */
+    var open = check.cost !== undefined && !check.owned
+    if (!open) {
+      btn.hidden = true
+      btn.textContent = ''
+      btn.removeAttribute('data-card')
+      btn.removeAttribute('title')
+      return
+    }
+    btn.hidden = false
+    btn.setAttribute('data-card', card.id)
+    btn.disabled = !check.ok
+    btn.textContent = check.ok
+      ? '兑换红碎工艺（' + check.cost + ' 个 HR 碎片）'
+      : '兑换红碎工艺（' + check.cost + ' 个 HR 碎片，现有 ' + check.have + '）'
+    if (check.ok) btn.removeAttribute('title')
+    else btn.setAttribute('title', check.reason)
+  }
+
+  /**
+   * 真的去兑换红碎工艺。
+   *
+   * 与 `doUnlockHr` 完全同一套做法：**先本地算、再同步**（静态站本地就是权威，
+   * 动态站把结果交给服务端再判一次并落盘），本地那一步读的是
+   * `shatterExchangeAfter` 的返回值，所以「扣了碎片没加上工艺」不可能出现。
+   */
+  function doExchangeShatter(cardId) {
+    var g = G()
+    if (!g || typeof g.shatterExchangeAfter !== 'function') {
+      toast('规则模块没加载，暂时不能兑换红碎', 'error')
+      return
+    }
+    var before = dataWithState()
+    var after = g.shatterExchangeAfter(before, cardId)
+    if (!after.ok) {
+      toast(after.reason, 'error')
+      return
+    }
+    var local = localState()
+    local.foils = after.foils
+    local.shards = after.shards
+    saveLocal(local)
+    applyStateToSnapshot({ foils: after.foils, shards: after.shards })
+    var card = cardById(cardId)
+    // 换完之后这张卡就该显示红碎效果了：把它设成当前展示的工艺
+    // （否则读者刚花掉 30 个碎片，看到的还是原来那张全闪，像是没生效）
+    setFoilView(cardId, 'shatter')
+    var done = function () {
+      render()
+      if (card && state.cardOpen === cardId) paintCardDialog(card)
+    }
+    var okMsg = '已兑换红碎工艺（花掉 ' + after.cost + ' 个 HR 碎片）'
+    if (BACKEND && state.unlocked) {
+      request('/player/shatter', { method: 'POST', body: { cardId: cardId } })
+        .then(function (res) {
+          if (res && res.player && state.data) state.data.player = res.player
+          done()
+          toast(okMsg, 'ok')
+        })
+        .catch(function (err) {
+          // 本地已经加上了：必须说清「本机记了、服务端没记」
+          done()
+          toast('已在本机兑换，但同步到服务端失败：' + ((err && err.message) || err), 'error')
+        })
+      return
+    }
+    done()
+    toast(okMsg, 'ok')
+  }
+
   function paintCardDialog(card) {
     var S = window.GachaShards
     var img = state.els.cardDialogImg
@@ -7309,6 +7494,8 @@
      */
     paintDialogMedia(card, img, nofile)
     paintHrButton(card)
+    // 红碎兑换（拥有全闪的 UR/SP）：判定在 draw.js，这里只画与说明
+    paintShatterButton(card)
 
     var n = Number(collection()[card.id] || 0)
     if (ownerEl) {
@@ -7736,6 +7923,13 @@
         if (cardId) doUnlockHr(cardId)
       })
     }
+    // 兑换红碎工艺：拥有全闪的 UR/SP 可以花 HR 碎片直接换红碎（用户 2026-09-22）
+    if (e.cardDialogShatter) {
+      e.cardDialogShatter.addEventListener('click', function () {
+        var cardId = e.cardDialogShatter.getAttribute('data-card')
+        if (cardId) doExchangeShatter(cardId)
+      })
+    }
     // 大图弹层被 Esc / 点遮罩关掉时，state.cardOpen 也要跟着清掉，
     // 否则再点同一张卡会被误判成「已经开着」。这条路径不经过 closeCardDialog，
     // 所以换过工艺时的重画也要在这里补一次。
@@ -7927,5 +8121,12 @@
     // 图片镜像：测试要能直接断言「抓图的清单」与「渲染用的地址」是同一份
     allImageUrls: allImageUrls,
     mirrorBases: mirrorBases,
+    // 红碎兑换：测试要能直接问「这张卡现在能不能换、为什么不能」，
+    // 而不是从按钮文案反推（文案改动不该弄红一条规则断言）
+    shatterStatus: function (cardId) {
+      var g = G()
+      return g && typeof g.canExchangeShatter === 'function' ? g.canExchangeShatter(dataWithState(), cardId) : null
+    },
+    exchangeShatter: doExchangeShatter,
   }
 })()
