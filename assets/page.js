@@ -692,13 +692,24 @@
           .map(function (x) { return '「' + x.card.name + '」' })
           .join('、')
       }
+      /*
+       * 报喜/报忧的文案按**条件类型**说（2026-09-26 加了「持有某张卡的红碎」这一类）：
+       *   · 系列类：说清是哪个系列（读者马上知道是去补哪一批卡）
+       *   · 工艺类：说清是哪两张卡的红碎（读者要回去看那张卡有没有红碎）
+       * 用同一个句式硬套的话，工艺类会印出「集齐「undefined」系列」。
+       */
+      var why = function (entry) {
+        var req = entry.requirement || {}
+        if (req.kind === 'series' && req.series) return '集齐「' + req.series.series + '」系列'
+        if (req.kind === 'needs' && req.needs) return '满足' + (req.label || '红碎条件')
+        return req.label || '满足条件'
+      }
       if (r.granted.length) {
-        toast('集齐「' + r.granted[0].progress.series + '」系列，获得纪念卡 ' + names(r.granted) + '（含全部特殊工艺）', 'ok')
+        toast(why(r.granted[0]) + '，获得纪念卡 ' + names(r.granted) + '（含全部特殊工艺）', 'ok')
       }
       if (r.revoked.length) {
         toast(
-          '「' + r.revoked[0].progress.series + '」系列又新增了卡，纪念卡 ' + names(r.revoked) +
-            ' 已暂时回收（重新集齐 ' + r.revoked[0].progress.total + ' 张后会再发一次）',
+          why(r.revoked[0]) + '的条件不再满足，纪念卡 ' + names(r.revoked) + ' 已暂时回收（重新满足后会再发一次）',
           'error'
         )
       }
@@ -3107,7 +3118,7 @@
         kind: 'pool',
         key: 'pool:__memorial__',
         label: '纪念',
-        desc: '无法抽卡获得：重置存档时赠送，或集齐指定系列后获得',
+        desc: '无法抽卡获得：重置存档时赠送，或满足条件后获得（集齐指定系列 / 持有指定卡的红碎）',
         coverUrl: '',
         coverCard: null,
         cover: coverOf(memorial),
@@ -3587,22 +3598,18 @@
         holder.appendChild(cardFigure(c, { finish: finishFor(c.id), dynamic: dyn }))
         if (n > 0) holder.appendChild(el('div', { class: 'badge-owned', text: n > 1 ? '×' + n : '已获得' }))
         /*
-         * 「集齐系列才有」的纪念卡：没拿到时把**还差多少**写在卡上。
+         * 「有条件才有」的纪念卡：没拿到时把**还差多少**写在卡上。
          *
          * 不写的话这张卡与「重置就送」的纪念卡长得一模一样，读者只会以为
          * 「重置一下就有了」—— 而它恰恰是重置**拿不到**的那一类。
+         * 条件有两类（集齐某个系列 / 持有某张卡的红碎），文案都由 shards.js 的
+         * `memorialRequirement` 给出（label 短句 + detail 长句），这里只负责画。
          */
         if (n <= 0) {
           var Sh = window.GachaShards
-          var need = Sh && typeof Sh.memorialRequirement === 'function' ? Sh.memorialRequirement(state.data, c, owned) : null
+          var need = Sh && typeof Sh.memorialRequirement === 'function' ? Sh.memorialRequirement(state.data, c, player()) : null
           if (need) {
-            holder.appendChild(
-              el('div', {
-                class: 'badge-need',
-                text: '集齐' + need.series + ' ' + need.got + '/' + need.total,
-                title: '集齐「' + need.series + '」系列（共 ' + need.total + ' 张）后自动获得，并附赠全部特殊工艺；系列加新卡时会暂时回收',
-              })
-            )
+            holder.appendChild(el('div', { class: 'badge-need', text: need.label, title: need.detail }))
           }
         }
         // 拥有的闪卡在格子上挂一个小标签，一眼能扫出「这张我有工艺版本」
@@ -5036,15 +5043,16 @@
    *
    * 🔑 **两类纪念卡的获取途径完全不同，必须分开算**（用户 2026-09-20 之后）：
    *   · `reset`  —— 重置存档时赠送（奇迹系列）。「缺不缺」只按这一批判断：
-   *                公告弹窗承诺的是「重置会送全部 N 张」，把「集齐系列」的那张
+   *                公告弹窗承诺的是「重置会送全部 N 张」，把「有条件才有」的那张
    *                算进来就等于**劝读者做一件没用的事**（重置完它立刻被回收）。
-   *   · `series` —— 集齐指定系列后获得，附带「还差几张」的进度。
+   *   · `condition` —— 满足条件后获得（集齐系列 / 持有指定红碎），
+   *                附带「还差多少」的进度（`requirement.label` / `.detail`）。
    */
   function memorialStatus() {
     var S = window.GachaShards
     var all = S && typeof S.memorialCards === 'function' ? S.memorialCards(state.data) : []
     var resetOnes = S && typeof S.resetMemorialCards === 'function' ? S.resetMemorialCards(state.data) : all
-    var seriesOnes = S && typeof S.seriesMemorialCards === 'function' ? S.seriesMemorialCards(state.data) : []
+    var condOnes = S && typeof S.conditionMemorialCards === 'function' ? S.conditionMemorialCards(state.data) : []
     var have = collection()
     var pick = function (list) {
       var owned = []
@@ -5057,15 +5065,20 @@
       return { owned: owned, missing: missing }
     }
     var r = pick(resetOnes)
-    var series = seriesOnes.map(function (c) {
-      var need = S && typeof S.memorialRequirement === 'function' ? S.memorialRequirement(state.data, c, have) : null
+    // ⚠️ 条件判定要看 `foils`（工艺条件），所以传 **player 对象**而不是 owned 表
+    var me = player()
+    var conditions = condOnes.map(function (c) {
+      var need = S && typeof S.memorialRequirement === 'function' ? S.memorialRequirement(state.data, c, me) : null
       return { card: c, owned: Number(have[c.id] || 0) > 0, progress: need }
     })
     return {
       total: resetOnes.length,
       owned: r.owned,
       missing: r.missing,
-      series: series,
+      // 旧字段名保留（`series`）—— 它现在的含义是「有条件才有」的那一批，
+      // 测试与公告弹窗都读它；改名会牵动一串调用点，不值得
+      series: conditions,
+      conditions: conditions,
       allTotal: all.length,
     }
   }
@@ -5114,8 +5127,9 @@
       e.noticeLead.textContent =
         '本站共有 ' + st.total + ' 张「重置赠送」的纪念卡，你已拥有 ' + st.owned.length + ' 张。' +
         '它们不在任何卡池里，也不能用碎片合成 —— 只能通过「清空缓存（重置存档）」赠送。' +
-        (st.series.length
-          ? '（另有 ' + st.series.length + ' 张是**集齐指定系列**获得的，重置拿不到，见图鉴「纪念」分组。）'
+        (st.conditions.length
+          ? '（另有 ' + st.conditions.length + ' 张是**满足条件**获得的（集齐指定系列 / 持有指定卡的红碎），' +
+            '重置拿不到，见图鉴「纪念」分组里卡面上的角标。）'
           : '')
     }
     if (e.noticeList) {

@@ -773,24 +773,56 @@
   }
 
   /**
-   * 纪念卡里「**重置存档就送**」的那一批（`memorialFor` 为空）。
+   * 纪念卡里「**重置存档就送**」的那一批（没有任何条件字段）。
    *
    * 公告弹窗只该拿这一批去判断「缺不缺」并承诺「重置会送全部 N 张」——
-   * 把「集齐系列才有」的卡也算进去，弹窗就会**骗人**：它会劝读者重置去领一张
-   * 重置完立刻被回收的卡。这是 2026-09-20 加 `memorialFor` 时最容易漏的一处。
+   * 把「有条件才有」的卡也算进去，弹窗就会**骗人**：它会劝读者重置去领一张
+   * 重置完立刻被回收的卡。这是 2026-09-20 加 `memorialFor` 时最容易漏的一处，
+   * 2026-09-26 加 `memorialNeeds` 时又验证了一遍同一个坑。
    */
   function resetMemorialCards(data) {
     var all = memorialCards(data)
     var out = []
-    for (var i = 0; i < all.length; i++) if (!all[i].memorialFor) out.push(all[i])
+    for (var i = 0; i < all.length; i++) {
+      if (!all[i].memorialFor && !memorialNeedsOf(all[i]).length) out.push(all[i])
+    }
     return out
   }
 
-  /** 纪念卡里「**集齐某个系列才给**」的那一批（`memorialFor` 非空） */
-  function seriesMemorialCards(data) {
+  /**
+   * 某张纪念卡的条件式需求。
+   *
+   * 除了 `lib/data.js` 的归一化之外，这里**再做一次校验**（认识的工艺 id）：
+   * 条件里的工艺写错时，这个条件永远满足不了，而界面上只会显示「差一张」——
+   * 那是最难查的一类数据错误。多校验一次的成本可以忽略。
+   */
+  function memorialNeedsOf(card) {
+    var raw = (card && card.memorialNeeds) || []
+    if (!Array.isArray(raw)) return []
+    var known = foilIds()
+    var out = []
+    for (var i = 0; i < raw.length; i++) {
+      var one = raw[i]
+      if (!one || typeof one !== 'object') continue
+      var name = String(one.name == null ? '' : one.name).trim()
+      var foil = String(one.foil == null ? '' : one.foil).trim()
+      if (!name || known.indexOf(foil) < 0) continue
+      out.push({ name: name, foil: foil })
+    }
+    return out
+  }
+
+  /**
+   * 纪念卡里「**要满足条件才给**」的那一批（`memorialFor` 或 `memorialNeeds` 非空）。
+   *
+   * 两种条件可以同时写（数据上允许）：集齐系列 **且** 持有指定工艺。
+   */
+  function conditionMemorialCards(data) {
     var all = memorialCards(data)
     var out = []
-    for (var i = 0; i < all.length; i++) if (all[i].memorialFor) out.push(all[i])
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].memorialFor || memorialNeedsOf(all[i]).length) out.push(all[i])
+    }
     return out
   }
 
@@ -820,30 +852,135 @@
     return { series: name, total: total, got: got, complete: total > 0 && got >= total }
   }
 
-  /**
-   * 某张纪念卡的获取条件。返回 `null` = 这张不是「集齐系列」类的纪念卡。
-   * 界面用它画「集齐「冥幽」系列 3/5」这类提示。
-   */
-  function memorialRequirement(data, card, ownedMap) {
-    if (!card || !card.memorial || !card.memorialFor) return null
-    var owned = ownedMap || (data && data.player && data.player.owned) || {}
-    return seriesProgress(data, card.memorialFor, owned)
+  /** 按**精确同名**在名册里找卡（条件里的 `name` 就是这么用的） */
+  function cardsByName(data, name) {
+    var want = String(name == null ? '' : name)
+    var out = []
+    var cards = (data && data.cards) || []
+    if (!want) return out
+    for (var i = 0; i < cards.length; i++) {
+      if (cards[i] && String(cards[i].name || '') === want) out.push(cards[i])
+    }
+    return out
+  }
+
+  /** 某个玩家的工艺列表（只读） */
+  function foilList(player, cardId) {
+    var list = ((player && player.foils) || {})[cardId]
+    return Array.isArray(list) ? list : []
   }
 
   /**
-   * 把「集齐系列才有」的纪念卡**对齐到当前收集状态**（纯函数，就地改 `data.player`）。
+   * `memorialNeeds` 的逐条实况（界面、判定共用这一份）。
+   *
+   * 每条给：这张卡现在**有没有拥有**、**有没有那一门工艺**。
+   * 名字匹配到多张时取**第一张**并标 `ambiguous`（作者写重名时不至于「永远发不出来」，
+   * 但界面上要看得出「这个名字对应多张卡」）。
+   */
+  function memorialNeedItems(data, card, playerLike) {
+    var player = playerLike || (data && data.player) || {}
+    var owned = player.owned || {}
+    var needs = memorialNeedsOf(card)
+    var items = []
+    for (var i = 0; i < needs.length; i++) {
+      var need = needs[i]
+      var hits = cardsByName(data, need.name)
+      var hit = hits[0] || null
+      var has = !!hit && Number(owned[hit.id] || 0) > 0
+      var hasFoil = !!hit && foilList(player, hit.id).indexOf(need.foil) >= 0
+      items.push({
+        name: need.name,
+        foil: need.foil,
+        cardId: hit ? hit.id : '',
+        found: !!hit,
+        matches: hits.length,
+        ambiguous: hits.length > 1,
+        owned: has,
+        hasFoil: hasFoil,
+      })
+    }
+    var got = 0
+    for (var j = 0; j < items.length; j++) if (items[j].hasFoil) got++
+    return { items: items, total: items.length, got: got, complete: items.length > 0 && got >= items.length }
+  }
+
+  /** 工艺 id -> 显示名（拿不到 draw.js 时退回 id 本身） */
+  function foilLabelOf(foil) {
+    var g = root && root.Gacha
+    var kinds = (g && g.FOIL_KINDS) || []
+    for (var i = 0; i < kinds.length; i++) if (kinds[i].id === foil) return kinds[i].label || foil
+    if (foil === 'flat') return '平闪'
+    if (foil === 'full') return '全闪'
+    if (foil === 'shatter') return '红碎'
+    return String(foil)
+  }
+
+  /**
+   * 某张纪念卡的获取条件（界面用它画角标与说明；判定也走它）。
+   *
+   * 返回 `null` = 这张不是「有条件才有」的纪念卡（= 重置就送的那一类）。
+   * 形状：
+   *   `{ kind: 'series'|'needs'|'both', complete, series, needs, label, detail }`
+   * `label` 是角标上的短句（如 `集齐冥幽 3/5` / `红碎 1/2`），`detail` 是 title 里的长句。
+   *
+   * ⚠️ 第三个参数从「owned 表」换成了「player 对象」（2026-09-26 加 `memorialNeeds` 时）：
+   * 新条件要看 `foils`，光有 owned 判不出来。传旧形状（一个 owned 表）也兼容 ——
+   * 那种情况下 `foils` 视为空，也就是「工艺条件一律不满足」。
+   */
+  function memorialRequirement(data, card, playerLike) {
+    if (!card || !card.memorial) return null
+    var player = playerLike || (data && data.player) || {}
+    // 兼容老调用方：直接传了一张 owned 表（id -> 张数）
+    if (playerLike && !playerLike.owned && !playerLike.foils && typeof playerLike === 'object') {
+      player = { owned: playerLike, foils: {} }
+    }
+    var out = { kind: '', complete: false, series: null, needs: null, label: '', detail: '' }
+    if (card.memorialFor) {
+      var prog = seriesProgress(data, card.memorialFor, player.owned || {})
+      out.series = prog
+      out.label = '集齐' + prog.series + ' ' + prog.got + '/' + prog.total
+      out.detail = '集齐「' + prog.series + '」系列（共 ' + prog.total + ' 张，现在 ' + prog.got + ' 张）后自动获得'
+    }
+    if (memorialNeedsOf(card).length) {
+      var need = memorialNeedItems(data, card, player)
+      out.needs = need
+      var parts = []
+      for (var i = 0; i < need.items.length; i++) {
+        parts.push(foilLabelOf(need.items[i].foil) + '「' + need.items[i].name + '」')
+      }
+      out.label = '红碎条件 ' + need.got + '/' + need.total
+      out.detail = '同时拥有 ' + parts.join('、') + '（现在 ' + need.got + '/' + need.total + '）后自动获得'
+    }
+    if (out.series && out.needs) out.kind = 'both'
+    else if (out.series) out.kind = 'series'
+    else if (out.needs) out.kind = 'needs'
+    else return null
+    out.complete = (!out.series || out.series.complete) && (!out.needs || out.needs.complete)
+    if (out.kind === 'both') out.label = out.series.series + ' ' + out.series.got + '/' + out.series.total + ' · 红碎 ' + out.needs.got + '/' + out.needs.total
+    out.detail +=
+      '；并附赠全部特殊工艺。**条件不再满足时会暂时回收**' +
+      (out.kind === 'series' || out.kind === 'both' ? '（系列加新卡就属于这种情况）' : '（把那张卡的红碎用掉是不可能的，所以这通常意味着数据被改过）') +
+      '，重新满足后再发一次。'
+    return out
+  }
+
+  /**
+   * 把「有条件才有」的纪念卡**对齐到当前收集状态**（纯函数，就地改 `data.player`）。
    *
    * 用户 2026-09-20：「在收集完成『冥幽』系列之后领取。如果后续『冥幽』系列推出
    * 新的卡片，则纪念卡会被回收，在重新收集完成时再次获得。」
+   * 用户 2026-09-26：又加了「同时拥有红碎的 UR『小叶·魔法少女』与『小叶·游园会』」
+   * 这种**按工艺**的条件（同一套双向判定，只是条件换成 `memorialNeeds`）。
    *
    * 这是一个**双向**判定，不是一个一次性发奖：
-   *   · 系列集齐了、卡还没有 -> **发放**（`owned` +1，并附赠**全部**特殊工艺）
-   *   · 系列没集齐、卡却有   -> **回收**（连同它的工艺一起删掉）
+   *   · 条件满足了、卡还没有 -> **发放**（`owned` +1，并附赠**全部**特殊工艺）
+   *   · 条件不满足、卡却有   -> **回收**（连同它的工艺一起删掉）
    * 所以它必须在**三处**都跑：服务端每次写存档之后、服务端每次下发状态之前
-   *（系列扩编是改数据、不是改存档，只挂在写路径上会漏掉）、以及客户端本地记账之后。
+   *（条件里的「系列里有哪些卡」是**数据**，改数据不会经过写路径）、
+   * 以及客户端本地记账之后。
    *
    * @returns {{changed:boolean, granted:Array, revoked:Array, owned:Object, foils:Object}}
-   *          `granted`/`revoked` 里的每一项是 `{ card, progress }`，供界面报喜/说明。
+   *          `granted`/`revoked` 里的每一项是 `{ card, progress, requirement }`。
    */
   function reconcileMemorials(data) {
     var player = data && data.player
@@ -860,20 +997,23 @@
     var all = foilIds().slice()
     var granted = []
     var revoked = []
-    var list = seriesMemorialCards(data)
+    var list = conditionMemorialCards(data)
+    // 判定要同时看「拥有」与「工艺」，所以把当前的两张表包成一个 player 形状传下去
+    var probe = { owned: owned, foils: foils }
     for (var i = 0; i < list.length; i++) {
       var card = list[i]
-      var p = seriesProgress(data, card.memorialFor, owned)
+      var req = memorialRequirement(data, card, probe)
+      if (!req) continue
       var has = Number(owned[card.id] || 0) > 0
-      if (p.complete && !has) {
+      if (req.complete && !has) {
         owned[card.id] = 1
         // 「纪念卡的赠送同样会附赠所有特殊工艺」（用户 2026-09-20）
         if (all.length) foils[card.id] = all.slice()
-        granted.push({ card: card, progress: p })
-      } else if (!p.complete && has) {
+        granted.push({ card: card, progress: req.series || req.needs, requirement: req })
+      } else if (!req.complete && has) {
         delete owned[card.id]
         delete foils[card.id]
-        revoked.push({ card: card, progress: p })
+        revoked.push({ card: card, progress: req.series || req.needs, requirement: req })
       }
     }
 
@@ -901,7 +1041,9 @@
     resetPlayer: resetPlayer,
     memorialCards: memorialCards,
     resetMemorialCards: resetMemorialCards,
-    seriesMemorialCards: seriesMemorialCards,
+    conditionMemorialCards: conditionMemorialCards,
+    memorialNeedsOf: memorialNeedsOf,
+    memorialNeedItems: memorialNeedItems,
     seriesProgress: seriesProgress,
     memorialRequirement: memorialRequirement,
     reconcileMemorials: reconcileMemorials,
