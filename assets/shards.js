@@ -412,10 +412,9 @@
       // 大图截图上看到才发现（这类「第三处漏改」正是第 147/152 条那个坑的又一例）。
       if (target.memorial) {
         var req = memorialRequirement(data, target, (data && data.player) || null)
-        var how = req && req.detail ? req.detail : '只能在「清空缓存」（重置存档）时获赠'
-        // `detail` 是给角标 title 的长句（末尾带「并附赠全部特殊工艺…」），
-        // 这里只要获取方式那半句，读起来才像一句拒绝理由
-        how = String(how).split('；')[0]
+        // `how` 是「怎么获得」那一句（不含后面那句回收策略）——2026-09-28 之前这里
+        // 是拿 `detail` 按「；」切一刀，星光值那段一加进来就把后半句（SR 不计分）切掉了
+        var how = req && req.how ? req.how : '只能在「清空缓存」（重置存档）时获赠'
         return {
           ok: false,
           error: '「' + (target.name || cardId) + '」是纪念卡 —— 不能用碎片合成，' + how,
@@ -790,7 +789,7 @@
     var all = memorialCards(data)
     var out = []
     for (var i = 0; i < all.length; i++) {
-      if (!all[i].memorialFor && !memorialNeedsOf(all[i]).length) out.push(all[i])
+      if (!all[i].memorialFor && !all[i].memorialStars && !memorialNeedsOf(all[i]).length) out.push(all[i])
     }
     return out
   }
@@ -818,16 +817,204 @@
     return out
   }
 
+  // ---------------------------------------------------------------------------
+  // 星光值（用户 2026-09-30）
+  // ---------------------------------------------------------------------------
+  //
+  // 原话：「归属于『我与我的群友』中的卡片……每张 SSR 计 1 分，UR 计 5 分，SP 计 10 分，
+  //   重复卡牌也计算……拥有特殊工艺额外加分：平闪 1 / 全闪 10 / 红碎 20……
+  //   SR 卡均不计算分数。当星光值总计达到 6000 时，解锁这张卡的平卡，
+  //   当总计达到 9000,15000,25000 时，分别解锁平闪，全闪，以及红碎的特殊工艺。」
+  //
+  // 三条判定纪律（都被断言钉住）：
+  //   · **重复按张数**（`owned[id] = 4` 就是 4 份分值），**工艺加分每张卡只算一次**；
+  //   · **只算属于「我与我的群友」卡池的卡** —— 判据直接用 `poolCardIds`
+  //     （池子成员只有那一份定义），所以「常驻」的 UR/SP 也算（该池白名单里有 `常驻`）；
+  //   · 隐藏卡 / 纪念卡不算（`poolCardIds` 本来就把它们排除在外）。
+  //
+  // 「我与我的群友」是**哪个池**不写死 id：按名字找（`qunyou` / 「我与我的群友」都认），
+  // 找不到就退化成「第一个池」。写死 `'qunyou'` 的话，哪天作者把池 id 改了，
+  // 星光值会**静默变成 0**（页面只显示「还需 6000 星光值」）。
+
+  var STAR_DEFAULTS = {
+    enabled: true,
+    perRarity: { SSR: 1, UR: 5, '???': 10 },
+    perFoil: { flat: 1, full: 10, shatter: 20 },
+    plain: 6000,
+    flat: 9000,
+    full: 15000,
+    shatter: 25000,
+  }
+
+  /** 星光值配置（缺字段时退回默认值，与 lib/data.js 的 defaultStars 一致） */
+  function starlightConfig(dataOrSettings) {
+    var s = dataOrSettings && dataOrSettings.settings ? dataOrSettings.settings : dataOrSettings || {}
+    var raw = s && s.stars && typeof s.stars === 'object' ? s.stars : {}
+    var int = function (v, fb) {
+      var n = Number(v)
+      return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fb
+    }
+    var perRarity = {}
+    var srcR = raw.perRarity && typeof raw.perRarity === 'object' ? raw.perRarity : STAR_DEFAULTS.perRarity
+    for (var k in srcR) {
+      if (!Object.prototype.hasOwnProperty.call(srcR, k)) continue
+      perRarity[k] = int(srcR[k], 0)
+    }
+    var perFoil = {}
+    var known = foilIds()
+    for (var i = 0; i < known.length; i++) {
+      var id = known[i]
+      var srcF = raw.perFoil && typeof raw.perFoil === 'object' ? raw.perFoil[id] : undefined
+      perFoil[id] = int(srcF, Number(STAR_DEFAULTS.perFoil[id] || 0))
+    }
+    return {
+      enabled: raw.enabled !== false,
+      perRarity: perRarity,
+      perFoil: perFoil,
+      plain: int(raw.plain, STAR_DEFAULTS.plain),
+      flat: int(raw.flat, STAR_DEFAULTS.flat),
+      full: int(raw.full, STAR_DEFAULTS.full),
+      shatter: int(raw.shatter, STAR_DEFAULTS.shatter),
+    }
+  }
+
+  /** 「我与我的群友」是哪个池（按 id 再按名字找；都没有就退回第一个池） */
+  function starlightPool(data) {
+    var pools = (data && data.pools) || []
+    for (var i = 0; i < pools.length; i++) {
+      if (String(pools[i].id) === 'qunyou') return pools[i]
+    }
+    for (var j = 0; j < pools.length; j++) {
+      if (String(pools[j].name || '').indexOf('群友') >= 0) return pools[j]
+    }
+    return pools[0] || null
+  }
+
   /**
-   * 纪念卡里「**要满足条件才给**」的那一批（`memorialFor` 或 `memorialNeeds` 非空）。
+   * 星光值总额 + 逐卡明细（**唯一一份判据**：界面与发放都用它）。
    *
-   * 两种条件可以同时写（数据上允许）：集齐系列 **且** 持有指定工艺。
+   * @returns {{total:number, enabled:boolean, poolId:string, cards:Array, config:object}}
+   *          `cards` 里每项：`{ card, copies, points, foilPoints, total, foils }`
+   */
+  function starlightPoints(data, playerLike) {
+    var cfg = starlightConfig(data)
+    var player = playerLike || (data && data.player) || {}
+    var owned = player.owned || {}
+    var pool = starlightPool(data)
+    var out = { total: 0, enabled: !!cfg.enabled, poolId: pool ? String(pool.id) : '', cards: [], config: cfg }
+    if (!pool) return out
+    /*
+     * 池子成员从**快照里的 `pool.byRarity`** 拿 —— 那是服务端/导出脚本用
+     * `lib/data.js` 的 `poolCardIds` 算好的（隐藏卡、纪念卡、坏档位都已经排除）。
+     * 好处是浏览器这边**不需要**再实现一遍成员判定：两份实现迟早会分叉，
+     * 而这个项目为「同一份规则只写一遍」已经踩过足够多的坑。
+     */
+    var ids = []
+    var buckets = pool.byRarity && typeof pool.byRarity === 'object' ? pool.byRarity : {}
+    for (var r in buckets) {
+      if (!Object.prototype.hasOwnProperty.call(buckets, r)) continue
+      if (Array.isArray(buckets[r])) ids = ids.concat(buckets[r])
+    }
+    var byId = {}
+    var cards = (data && data.cards) || []
+    for (var i = 0; i < cards.length; i++) byId[cards[i].id] = cards[i]
+    for (var j = 0; j < ids.length; j++) {
+      var card = byId[ids[j]]
+      if (!card) continue
+      var copies = Math.max(0, Math.floor(Number(owned[card.id] || 0)))
+      var per = Math.max(0, Number(cfg.perRarity[String(card.rarity)] || 0))
+      var points = copies * per
+      var mine = foilList(player, card.id)
+      var foilPoints = 0
+      var got = []
+      for (var f = 0; f < mine.length; f++) {
+        var fid = String(mine[f])
+        // 不认识的工艺 id 既不加分也不算「拥有」——留着它不会报错，只会把总分算高
+        if (!Object.prototype.hasOwnProperty.call(cfg.perFoil, fid)) continue
+        // 同一门工艺写了两遍也只加一次（归一化本来就去重，这里是第二道保险）
+        if (got.indexOf(fid) >= 0) continue
+        foilPoints += Math.max(0, Number(cfg.perFoil[fid] || 0))
+        got.push(fid)
+      }
+      // 一张都没有、工艺也没有的卡不进明细（明细是给「我攒了哪些星光值」看的）
+      if (!copies && !got.length) continue
+      out.cards.push({
+        card: card,
+        copies: copies,
+        points: points,
+        foilPoints: foilPoints,
+        total: points + foilPoints,
+        foils: got,
+        perRarity: per,
+      })
+      out.total += points + foilPoints
+    }
+    out.cards.sort(function (a, b) {
+      return b.total - a.total
+    })
+    return out
+  }
+
+  /**
+   * 四个门槛的当前状态。
+   *
+   * 顺序固定为 平卡 -> 平闪 -> 全闪 -> 红碎（`plain` 特殊：它不是一门工艺，
+   * 而是「拿到这张卡本身」）。`foil` 为空串表示平卡那一档。
+   */
+  function starlightTiers(data, playerLike) {
+    var cfg = starlightConfig(data)
+    var total = starlightPoints(data, playerLike).total
+    var defs = [
+      { key: 'plain', foil: '', label: '平卡', need: cfg.plain },
+      { key: 'flat', foil: 'flat', label: foilLabelOf('flat'), need: cfg.flat },
+      { key: 'full', foil: 'full', label: foilLabelOf('full'), need: cfg.full },
+      { key: 'shatter', foil: 'shatter', label: foilLabelOf('shatter'), need: cfg.shatter },
+    ]
+    var out = []
+    for (var i = 0; i < defs.length; i++) {
+      var d = defs[i]
+      out.push({
+        key: d.key,
+        foil: d.foil,
+        label: d.label,
+        need: Math.max(0, Number(d.need) || 0),
+        reached: total >= Math.max(0, Number(d.need) || 0),
+      })
+    }
+    return { total: total, tiers: out, config: cfg }
+  }
+
+  /** 现在应该拥有哪些工艺（按门槛达到情况算；平卡那一档不给工艺） */
+  function starlightFoils(data, playerLike) {
+    var st = starlightTiers(data, playerLike)
+    var out = []
+    for (var i = 0; i < st.tiers.length; i++) {
+      if (st.tiers[i].foil && st.tiers[i].reached) out.push(st.tiers[i].foil)
+    }
+    return out
+  }
+
+  /** 下一档还差多少（全解锁时返回 null） */
+  function starlightNext(data, playerLike) {
+    var st = starlightTiers(data, playerLike)
+    for (var i = 0; i < st.tiers.length; i++) {
+      if (!st.tiers[i].reached) {
+        return { key: st.tiers[i].key, label: st.tiers[i].label, need: st.tiers[i].need, missing: st.tiers[i].need - st.total }
+      }
+    }
+    return null
+  }
+
+  /**
+   * 纪念卡里「**要满足条件才给**」的那一批（`memorialFor` / `memorialNeeds` / `memorialStars` 任一非空）。
+   *
+   * 三种条件可以任意叠加（数据上允许），全部满足才算 `complete`。
    */
   function conditionMemorialCards(data) {
     var all = memorialCards(data)
     var out = []
     for (var i = 0; i < all.length; i++) {
-      if (all[i].memorialFor || memorialNeedsOf(all[i]).length) out.push(all[i])
+      if (all[i].memorialFor || all[i].memorialStars || memorialNeedsOf(all[i]).length) out.push(all[i])
     }
     return out
   }
@@ -940,12 +1127,12 @@
     if (playerLike && !playerLike.owned && !playerLike.foils && typeof playerLike === 'object') {
       player = { owned: playerLike, foils: {} }
     }
-    var out = { kind: '', complete: false, series: null, needs: null, label: '', detail: '' }
+    var out = { kind: '', complete: false, series: null, needs: null, stars: null, label: '', detail: '', how: '' }
     if (card.memorialFor) {
       var prog = seriesProgress(data, card.memorialFor, player.owned || {})
       out.series = prog
       out.label = '集齐' + prog.series + ' ' + prog.got + '/' + prog.total
-      out.detail = '集齐「' + prog.series + '」系列（共 ' + prog.total + ' 张，现在 ' + prog.got + ' 张）后自动获得'
+      out.how = '集齐「' + prog.series + '」系列（共 ' + prog.total + ' 张，现在 ' + prog.got + ' 张）后自动获得'
     }
     if (memorialNeedsOf(card).length) {
       var need = memorialNeedItems(data, card, player)
@@ -955,18 +1142,53 @@
         parts.push(foilLabelOf(need.items[i].foil) + '「' + need.items[i].name + '」')
       }
       out.label = '红碎条件 ' + need.got + '/' + need.total
-      out.detail = '同时拥有 ' + parts.join('、') + '（现在 ' + need.got + '/' + need.total + '）后自动获得'
+      out.how = '同时拥有 ' + parts.join('、') + '（现在 ' + need.got + '/' + need.total + '）后自动获得'
+    }
+    if (card.memorialStars) {
+      var st = starlightTiers(data, player)
+      out.stars = st
+      var next = null
+      for (var t = 0; t < st.tiers.length; t++) {
+        if (!st.tiers[t].reached) {
+          next = st.tiers[t]
+          break
+        }
+      }
+      out.label = next ? '星光值 ' + st.total + '/' + next.need : '星光值 ' + st.total + '（全解锁）'
+      var seg = []
+      for (var s2 = 0; s2 < st.tiers.length; s2++) {
+        seg.push(st.tiers[s2].label + ' ' + st.tiers[s2].need + (st.tiers[s2].reached ? '✓' : ''))
+      }
+      out.how =
+        '累计「星光值」达到门槛后逐档解锁：' + seg.join(' / ') +
+        '（现在 ' + st.total + ' 星光值' +
+        (next ? '，下一档「' + next.label + '」还差 ' + (next.need - st.total) : '，已全部解锁') +
+        '）。星光值的算法：属于「我与我的群友」的卡，SSR 每张 ' + (st.config.perRarity.SSR || 0) +
+        '、UR 每张 ' + (st.config.perRarity.UR || 0) + '、SP 每张 ' + (st.config.perRarity['???'] || 0) +
+        '（重复张数照算），每拥有平闪 / 全闪 / 红碎再各加 ' + st.config.perFoil.flat + ' / ' + st.config.perFoil.full + ' / ' + st.config.perFoil.shatter +
+        '（每张卡的每门工艺只加一次）；SR 不计分。'
     }
     if (out.series && out.needs) out.kind = 'both'
     else if (out.series) out.kind = 'series'
     else if (out.needs) out.kind = 'needs'
+    else if (out.stars) out.kind = 'stars'
     else return null
-    out.complete = (!out.series || out.series.complete) && (!out.needs || out.needs.complete)
+    out.complete =
+      (!out.series || out.series.complete) &&
+      (!out.needs || out.needs.complete) &&
+      (!out.stars || (out.stars.tiers.length > 0 && out.stars.tiers[0].reached))
     if (out.kind === 'both') out.label = out.series.series + ' ' + out.series.got + '/' + out.series.total + ' · 红碎 ' + out.needs.got + '/' + out.needs.total
-    out.detail +=
-      '；并附赠全部特殊工艺。**条件不再满足时会暂时回收**' +
-      (out.kind === 'series' || out.kind === 'both' ? '（系列加新卡就属于这种情况）' : '（把那张卡的红碎用掉是不可能的，所以这通常意味着数据被改过）') +
-      '，重新满足后再发一次。'
+    if (out.kind === 'stars') {
+      out.detail =
+        out.how +
+        '；达到哪一档就给到哪一档：平卡到手之后，平闪 / 全闪 / 红碎 会随着星光值继续涨而陆续补齐；星光值掉下去时会按同样的规则收回。'
+    } else {
+      out.detail =
+        out.how +
+        '；并附赠全部特殊工艺。**条件不再满足时会暂时回收**' +
+        (out.kind === 'series' || out.kind === 'both' ? '（系列加新卡就属于这种情况）' : '') +
+        '，重新满足后再发一次。'
+    }
     return out
   }
 
@@ -1011,14 +1233,47 @@
       var req = memorialRequirement(data, card, probe)
       if (!req) continue
       var has = Number(owned[card.id] || 0) > 0
+      /*
+       * 星光值那一档是**逐档解锁**的（用户 2026-09-30）：达到 6000 拿到平卡，
+       * 之后每到一个门槛补一门工艺。所以这里不能像别的条件那样「一次给全三种」——
+       * 目标是**恰好**该有的那一组工艺，多了少了都要写回去（这样「跌出高门槛」也能收回）。
+       */
+      if (req.stars) {
+        var want = starlightFoils(data, probe)
+        var cur = foilList(probe, card.id)
+        var sameFoils = cur.length === want.length
+        if (sameFoils) {
+          for (var w = 0; w < want.length; w++) if (cur.indexOf(want[w]) < 0) sameFoils = false
+        }
+        if (req.complete) {
+          if (!has || !sameFoils) {
+            owned[card.id] = Math.max(1, Number(owned[card.id] || 0))
+            if (want.length) foils[card.id] = want.slice()
+            else delete foils[card.id]
+            probe.foils = foils
+            granted.push({ card: card, progress: req.stars, requirement: req, foils: want.slice() })
+          }
+          continue
+        }
+        // 没到门槛：整张收回（连工艺）
+        if (has) {
+          delete owned[card.id]
+          delete foils[card.id]
+          probe.foils = foils
+          revoked.push({ card: card, progress: req.stars, requirement: req })
+        }
+        continue
+      }
       if (req.complete && !has) {
         owned[card.id] = 1
         // 「纪念卡的赠送同样会附赠所有特殊工艺」（用户 2026-09-20）
         if (all.length) foils[card.id] = all.slice()
+        probe.foils = foils
         granted.push({ card: card, progress: req.series || req.needs, requirement: req })
       } else if (!req.complete && has) {
         delete owned[card.id]
         delete foils[card.id]
+        probe.foils = foils
         revoked.push({ card: card, progress: req.series || req.needs, requirement: req })
       }
     }
@@ -1053,6 +1308,14 @@
     seriesProgress: seriesProgress,
     memorialRequirement: memorialRequirement,
     reconcileMemorials: reconcileMemorials,
+    // 星光值（用户 2026-09-30）
+    STAR_DEFAULTS: STAR_DEFAULTS,
+    starlightConfig: starlightConfig,
+    starlightPool: starlightPool,
+    starlightPoints: starlightPoints,
+    starlightTiers: starlightTiers,
+    starlightFoils: starlightFoils,
+    starlightNext: starlightNext,
     ticketRules: ticketRules,
     ticketStatus: ticketStatus,
     canExchangeTickets: canExchangeTickets,

@@ -3427,6 +3427,37 @@
     return box
   }
 
+  /**
+   * 头部的「星光值」徽章（用户 2026-09-30）。
+   *
+   * 规则本体在 `page/shards.js` 的 `starlightPoints` / `starlightTiers`
+   *（服务端、导出、客户端同一份）。这里只负责显示总额与四档进度。
+   * 一笔都还没攒到时返回 null —— 不摆一个「星光值 0」的徽章。
+   */
+  function starlightPill() {
+    var g = window.GachaShards
+    if (!g || typeof g.starlightTiers !== 'function' || !state.data) return null
+    var st = g.starlightTiers(state.data, player())
+    if (!st.total) return null
+    var parts = []
+    for (var i = 0; i < st.tiers.length; i++) {
+      parts.push(st.tiers[i].label + ' ' + fmt(st.tiers[i].need) + (st.tiers[i].reached ? ' ✓' : ''))
+    }
+    var next = null
+    for (var j = 0; j < st.tiers.length; j++) if (!st.tiers[j].reached) { next = st.tiers[j]; break }
+    return el('span', {
+      class: 'pill pill-stars',
+      text: '星光值 ' + fmt(st.total),
+      title:
+        '星光值：属于「我与我的群友」的卡才算 —— SSR 每张 ' + fmt(st.config.perRarity.SSR || 0) +
+        '、UR 每张 ' + fmt(st.config.perRarity.UR || 0) + '、SP 每张 ' + fmt(st.config.perRarity['???'] || 0) +
+        '（重复张数照算），每拥有平闪 / 全闪 / 红碎再各加 ' +
+        fmt(st.config.perFoil.flat) + ' / ' + fmt(st.config.perFoil.full) + ' / ' + fmt(st.config.perFoil.shatter) +
+        '（每张卡的每门工艺只加一次）；SR 不计分。\n四档门槛：' + parts.join(' / ') +
+        (next ? '\n下一档「' + next.label + '」还差 ' + fmt(next.need - st.total) + ' 星光值。' : '\n已全部解锁。'),
+    })
+  }
+
   function viewCollection() {
     var view = state.els.view
     var wrap = el('div', { class: 'sec' })
@@ -3448,6 +3479,9 @@
           ? el('span', { class: 'pill', text: '重复 ' + fmt(player().duplicates) + ' 张' })
           : null,
         seriesNames.length ? el('span', { class: 'pill', text: seriesNames.length + ' 个系列' }) : null,
+        // 星光值（用户 2026-09-30）：属于「我与我的群友」的卡才计分，
+        // 所以只在真的攒出分值（> 0）时露出来，不摆一个恒为 0 的徽章
+        starlightPill(),
       ])
     )
 
@@ -3598,14 +3632,30 @@
         holder.appendChild(cardFigure(c, { finish: finishFor(c.id), dynamic: dyn }))
         if (n > 0) holder.appendChild(el('div', { class: 'badge-owned', text: n > 1 ? '×' + n : '已获得' }))
         /*
-         * 「有条件才有」的纪念卡：没拿到时把**还差多少**写在卡上。
+         * 「有条件才有」的纪念卡：把**还差多少**写在卡上。
          *
          * 不写的话这张卡与「重置就送」的纪念卡长得一模一样，读者只会以为
          * 「重置一下就有了」—— 而它恰恰是重置**拿不到**的那一类。
-         * 条件有两类（集齐某个系列 / 持有某张卡的红碎），文案都由 shards.js 的
-         * `memorialRequirement` 给出（label 短句 + detail 长句），这里只负责画。
+         * 条件有三类（集齐某个系列 / 持有某张卡的红碎 / 星光值门槛），文案都由
+         * shards.js 的 `memorialRequirement` 给出（label 短句 + detail 长句）。
+         *
+         * ⚠️ 星光值那类**已经拥有也要继续显示**（2026-09-30）：它是逐档解锁的 ——
+         * 拿到平卡之后还要看着角标知道离平闪/全闪/红碎还有多远。别的类型拿到就
+         * 不再显示（没有「下一步」了）。
          */
-        if (n <= 0) {
+        var showNeed = n <= 0
+        if (!showNeed) {
+          var Sh0 = window.GachaShards
+          if (Sh0 && typeof Sh0.memorialRequirement === 'function') {
+            var req0 = Sh0.memorialRequirement(state.data, c, player())
+            if (req0 && req0.stars) {
+              var allDone = true
+              for (var ti = 0; ti < req0.stars.tiers.length; ti++) if (!req0.stars.tiers[ti].reached) allDone = false
+              showNeed = !allDone
+            }
+          }
+        }
+        if (showNeed) {
           var Sh = window.GachaShards
           var need = Sh && typeof Sh.memorialRequirement === 'function' ? Sh.memorialRequirement(state.data, c, player()) : null
           if (need) {
@@ -5750,6 +5800,13 @@
     var hrCfg2 = s.hr || {}
     // 红碎兑换价（按档位）：缺字段时用 30 / 50（与 lib/data.js 的 defaultHr 一致）
     var shatterCostCfg = hrCfg2.shatterCost && typeof hrCfg2.shatterCost === 'object' ? hrCfg2.shatterCost : {}
+    // 星光值（用户 2026-09-30）：分值表 + 四个门槛
+    // ⚠️ 两张子表要**分别兜底**：`settings.stars` 存在但没有 perRarity 的中间态
+    // （老数据 / 只配了一半）会让 `starsCfg.perRarity.SSR` 直接抛异常，
+    // 而那个异常会把**整个后台板块**渲染成错误块（实测过）。
+    var starsCfg = s.stars && typeof s.stars === 'object' ? s.stars : {}
+    var starsPer = starsCfg.perRarity && typeof starsCfg.perRarity === 'object' ? starsCfg.perRarity : {}
+    var starsFoil = starsCfg.perFoil && typeof starsCfg.perFoil === 'object' ? starsCfg.perFoil : {}
     var dupCfg = s.dupReward || {}
     var rf = dailyCfg.rarityFactor || {}
     var ff = dailyCfg.foilFactor || {}
@@ -5799,6 +5856,24 @@
         }),
         field('重复' + foilLabel('flat') + '额外返几点', input('number', dupCfg.flatPoints === undefined ? 1 : dupCfg.flatPoints, 'dup-flat-points')),
         field('重复' + foilLabel('full') + '额外返几个 HR 碎片', input('number', dupCfg.fullHrShards === undefined ? 1 : dupCfg.fullHrShards, 'dup-full-hr')),
+        el('p', {
+          class: 'panel-hint',
+          text:
+            '星光值（用户 2026-09-30）：属于「我与我的群友」的卡计分 —— 重复张数照算，' +
+            '每张卡每拥有一门工艺再各加一次分；SR 不计分。纪念卡「众星捧月——致我们！」按这四个门槛逐档解锁。',
+        }),
+        el('div', { class: 'panel-sub', text: 'C：星光值 —— 每张卡的档位分值' }),
+        field('每张 SSR 的星光值', input('number', starsPer.SSR === undefined ? 1 : starsPer.SSR, 'stars-ssr')),
+        field('每张 UR 的星光值', input('number', starsPer.UR === undefined ? 5 : starsPer.UR, 'stars-ur')),
+        field('每张 SP 的星光值', input('number', starsPer['???'] === undefined ? 10 : starsPer['???'], 'stars-sp')),
+        field(foilLabel('flat') + '额外加分', input('number', starsFoil.flat === undefined ? 1 : starsFoil.flat, 'stars-foil-flat')),
+        field(foilLabel('full') + '额外加分', input('number', starsFoil.full === undefined ? 10 : starsFoil.full, 'stars-foil-full')),
+        field(foilLabel('shatter') + '额外加分', input('number', starsFoil.shatter === undefined ? 20 : starsFoil.shatter, 'stars-foil-shatter')),
+        el('div', { class: 'panel-sub', text: '星光值的四个解锁门槛' }),
+        field('解锁平卡', input('number', starsCfg.plain === undefined ? 6000 : starsCfg.plain, 'stars-plain')),
+        field('解锁' + foilLabel('flat'), input('number', starsCfg.flat === undefined ? 9000 : starsCfg.flat, 'stars-flat')),
+        field('解锁' + foilLabel('full'), input('number', starsCfg.full === undefined ? 15000 : starsCfg.full, 'stars-full')),
+        field('解锁' + foilLabel('shatter'), input('number', starsCfg.shatter === undefined ? 25000 : starsCfg.shatter, 'stars-shatter')),
         el('div', { class: 'panel-actions' }, [
           el('button', { class: 'btn primary', type: 'button', 'data-bind': 'save-daily' }, ['保存这一组']),
         ]),
@@ -6164,6 +6239,16 @@
           ['shatter-cost-sp', '换 SP 的红碎要几个 HR 碎片'],
           ['dup-flat-points', '重复面闪额外返几点'],
           ['dup-full-hr', '重复全闪额外返几个 HR 碎片'],
+          ['stars-ssr', '每张 SSR 的星光值'],
+          ['stars-ur', '每张 UR 的星光值'],
+          ['stars-sp', '每张 SP 的星光值'],
+          ['stars-foil-flat', '平闪额外加分'],
+          ['stars-foil-full', '全闪额外加分'],
+          ['stars-foil-shatter', '红碎额外加分'],
+          ['stars-plain', '解锁平卡的门槛'],
+          ['stars-flat', '解锁平闪的门槛'],
+          ['stars-full', '解锁全闪的门槛'],
+          ['stars-shatter', '解锁红碎的门槛'],
         ]
         for (var i = 0; i < specs.length; i++) {
           var v = readNum(specs[i][0], specs[i][1])
@@ -6220,6 +6305,16 @@
               shatterCost: { UR: vals['shatter-cost-ur'], '???': vals['shatter-cost-sp'] },
             },
             dupReward: { enabled: true, flatPoints: vals['dup-flat-points'], fullHrShards: vals['dup-full-hr'] },
+            // 星光值：分值表 + 四个门槛一次送上去（**整表**，与服务端归一化同一形状）
+            stars: {
+              enabled: true,
+              perRarity: { SSR: vals['stars-ssr'], UR: vals['stars-ur'], '???': vals['stars-sp'] },
+              perFoil: { flat: vals['stars-foil-flat'], full: vals['stars-foil-full'], shatter: vals['stars-foil-shatter'] },
+              plain: vals['stars-plain'],
+              flat: vals['stars-flat'],
+              full: vals['stars-full'],
+              shatter: vals['stars-shatter'],
+            },
           },
         })
           .then(function (res) { afterWrite(res, '签到 / HR / 重复返还已保存') })
