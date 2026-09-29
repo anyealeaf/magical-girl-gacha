@@ -1877,6 +1877,18 @@
     var cost = card ? cfg.cost[String(card.rarity)] : undefined
     if (!cfg.enabled) return { ok: false, reason: 'HR 碎片的兑换已关闭', have: have }
     if (!card) return { ok: false, reason: '名册里没有这张卡', have: have }
+    /*
+     * 纪念卡不开放这条兑换（2026-09-28，用户从大图截图上发现的）。
+     *
+     * 它们**进不了任何卡池**，所以永远抽不到「全闪」这张门票 —— 那个按钮只可能是
+     * 灰的、点了没反应；更糟的是读者会把它当成一条真的获取途径。而赠送纪念卡时
+     * 本来就**一次给全三种工艺**（见 page/shards.js 的 reconcileMemorials），
+     * 所以这条兑换对它们也没有意义。
+     * 返回时**不带 `cost`**：界面据此不显示这个按钮（见 page.js 的 paintShatterButton）。
+     */
+    if (card.memorial) {
+      return { ok: false, reason: '纪念卡不能用 HR 碎片换红碎（获赠时就已经带全部工艺了）', have: have }
+    }
     if (cost === undefined) {
       return {
         ok: false,
